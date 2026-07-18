@@ -1,0 +1,92 @@
+"""Background Linux process-tree RSS/PSS sampling."""
+
+from __future__ import annotations
+
+import csv
+import threading
+import time
+from pathlib import Path
+from typing import Callable
+
+
+def _children(pid: int) -> set[int]:
+    found = {pid}
+    changed = True
+    while changed:
+        changed = False
+        for entry in Path("/proc").iterdir():
+            if not entry.name.isdigit() or int(entry.name) in found:
+                continue
+            try:
+                fields = (entry / "stat").read_text().split()
+                parent = int(fields[3])
+            except (FileNotFoundError, PermissionError, IndexError, ValueError):
+                continue
+            if parent in found:
+                found.add(int(entry.name))
+                changed = True
+    return found
+
+
+def _kib(pid: int, filename: str, key: str) -> int:
+    try:
+        for line in Path(f"/proc/{pid}/{filename}").read_text().splitlines():
+            if line.startswith(key + ":"):
+                return int(line.split()[1])
+    except (FileNotFoundError, PermissionError, ProcessLookupError):
+        pass
+    return 0
+
+
+class MemorySampler:
+    """Sample summed process-tree memory to a phase-labeled CSV."""
+
+    def __init__(self, path: Path, roots: Callable[[], list[int]], phase: Callable[[], str],
+                 cadence_seconds: float = 2.0) -> None:
+        self.path = path
+        self.roots = roots
+        self.phase = phase
+        self.cadence_seconds = cadence_seconds
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._write_lock = threading.Lock()
+
+    def start(self) -> None:
+        """Start sampling in a daemon thread."""
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._thread = threading.Thread(target=self._run, name="memory-sampler", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        """Stop sampling and flush the CSV."""
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=self.cadence_seconds + 2)
+
+    def sample_now(self) -> None:
+        """Capture a phase-boundary sample in addition to the fixed cadence."""
+        self._sample()
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            self._sample()
+            self._stop.wait(self.cadence_seconds)
+
+    def _sample(self) -> None:
+        pids: set[int] = set()
+        for root in self.roots():
+            if root > 0 and Path(f"/proc/{root}").exists():
+                pids.update(_children(root))
+        rss = sum(_kib(pid, "status", "VmRSS") for pid in pids) * 1024
+        pss = sum(_kib(pid, "smaps_rollup", "Pss") for pid in pids) * 1024
+        with self._write_lock:
+            exists = self.path.exists() and self.path.stat().st_size > 0
+            with self.path.open("a", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=(
+                    "unix_time", "monotonic_seconds", "phase", "pids", "rss_bytes", "pss_bytes"
+                ))
+                if not exists:
+                    writer.writeheader()
+                writer.writerow({"unix_time": time.time(), "monotonic_seconds": time.monotonic(),
+                                 "phase": self.phase(), "pids": ";".join(map(str, sorted(pids))),
+                                 "rss_bytes": rss, "pss_bytes": pss})

@@ -1,0 +1,12 @@
+.cache/
+.venv/
+results/
+data/
+*.npy
+*.npz
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+

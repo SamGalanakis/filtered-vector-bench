@@ -1,0 +1,33 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "filtered-vector-bench"
+version = "0.1.0"
+description = "A fair side-by-side benchmark for filtered vector search"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {file = "LICENSE"}
+authors = [{name = "Samuel Galanakis"}]
+dependencies = [
+  "httpx>=0.28.1,<1",
+  "matplotlib>=3.10.0,<4",
+  "numpy>=2.2.0,<3",
+  "psycopg[binary]>=3.2.3,<4",
+  "PyYAML>=6.0.2,<7",
+]
+
+[project.optional-dependencies]
+dev = ["mypy>=1.14,<2", "pytest>=8.3,<9", "ruff>=0.9,<1", "types-PyYAML>=6.0.12,<7"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["fvb"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = ["results", ".cache"]
+
+[tool.mypy]
+strict = true

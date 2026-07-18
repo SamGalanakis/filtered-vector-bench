@@ -1,0 +1,28 @@
+seed: 20250308
+dimensions: [64]
+scales: [5000]
+selectivities: [1.0, 0.1, 0.01, 0.001]
+ef_values: [40]
+n_queries: 8
+k: 10
+clusters: 16
+cluster_sigma: 0.12
+batch_size: 250
+settle_seconds: 1
+client_timeout_seconds: 120
+memory_cap_gib: 4
+data_chunk_rows: 1000
+ground_truth_batch_rows: 5000
+postgres_modes: [default]
+churn:
+  enabled: false
+  seconds: 10
+  target_ops_per_second: 10
+engines:
+  surrealdb:
+    mode: docker
+    image: surrealdb/surrealdb:v3.2.1
+  postgres:
+    mode: docker
+    image: pgvector/pgvector:pg17
+
