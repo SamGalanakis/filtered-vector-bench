@@ -84,3 +84,30 @@ defaults and are captured in metadata.
    parity choices in `FAIRNESS.md`, and add it to the smoke workflow.
 
 Contributions should preserve deterministic inputs, raw results, and failure-as-data behavior.
+
+## Sample results
+
+One full run of `configs/default.yaml` (100k / 300k / 1M × 1024-dim, cosine, both engines at
+their own defaults) on a 16-core / 125 GiB Linux machine, July 2026. Full tables:
+[docs/sample-results/summary.md](docs/sample-results/summary.md). Engines: SurrealDB v3.2.1
+(RocksDB backend), PostgreSQL 17.10 + pgvector 0.8.3. Every number is reproducible with the
+quickstart commands above; raw JSONL/CSV evidence ships with each result directory.
+
+![Peak query-phase memory](docs/sample-results/memory-vs-scale-d1024.png)
+
+![Recall vs filter selectivity](docs/sample-results/recall-vs-selectivity-d1024.png)
+
+Highlights of this run — read [FAIRNESS.md](FAIRNESS.md) before quoting any of it:
+
+- **SurrealDB exceeded the memory cap (48 GiB) during the filtered query suite at 1M vectors**:
+  the first tenant-filtered KNN query grew the process until the OS terminated it, with the
+  EXPLAIN-verified index plan (`KnnScan` + pushed predicate) in effect. Its 100k/300k cells
+  completed normally, with generally stronger unfiltered recall than pgvector at equal ef.
+- **PostgreSQL completed every cell** within single-digit GiB and ~10 ms cold starts, but at
+  server-default memory settings its planner kept the HNSW plan at every selectivity, so
+  narrow-filter recall degrades sharply. (Under tuned memory settings the planner instead
+  switches to a B-tree + exact-distance plan for selective filters, which returns perfect
+  recall — plan choice, and therefore filtered recall, is configuration-sensitive.)
+- **Neither engine handles narrow filtered vector search well out of the box.** This is the
+  gap this benchmark exists to measure; the corpus here is deliberately hard (broad clusters),
+  so absolute recall is lower than tight-cluster benchmarks report.
