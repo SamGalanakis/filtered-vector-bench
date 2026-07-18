@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import socket
 import subprocess
 import tarfile
@@ -117,6 +118,7 @@ class SurrealDBEngine(Engine):
                 "docker", "create", "--name", self.container,
                 "--memory", str(self.memory_cap_bytes), "-p", f"127.0.0.1:{self.port}:8000",
                 "-e", "SURREAL_HTTP_MAX_SQL_BODY_SIZE=64MiB",
+                "-e", "SURREAL_HTTP_MAX_RPC_BODY_SIZE=64MiB",
                 "-v", f"{(self.workdir / 'data').resolve()}:/data",
                 self.settings.image or "surrealdb/surrealdb:v3.2.1", "start", "--log", "warn",
                 "--user", "root", "--pass", "root", "rocksdb:/data/fvb.db",
@@ -136,8 +138,11 @@ class SurrealDBEngine(Engine):
                 "--user", "root", "--pass", "root", f"rocksdb:{self.workdir / 'data' / 'fvb.db'}",
             ])
             log = (self.workdir / "surreal.log").open("ab")
+            env = dict(os.environ,
+                       SURREAL_HTTP_MAX_SQL_BODY_SIZE="64MiB",
+                       SURREAL_HTTP_MAX_RPC_BODY_SIZE="64MiB")
             self.process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT,
-                                            preexec_fn=preexec)  # type: ignore[arg-type]
+                                            env=env, preexec_fn=preexec)  # type: ignore[arg-type]
         deadline = time.monotonic() + self.timeout
         while time.monotonic() < deadline:
             try:
