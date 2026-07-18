@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 import hashlib
 import json
 import os
@@ -24,6 +25,35 @@ from fvb.engines.base import Engine, PhaseStats, Row, directory_size
 _ARCHIVE_SHA256 = {
     "v3.2.1": "7036eafd9ba07c3720d25a3201f780b81ec82eb2b4dcb56c9ea81b87655644e7",
 }
+MAX_LOAD_PAYLOAD_BYTES = 4 * 1024 * 1024
+LOAD_WORKERS = 4
+
+
+def _insert_bodies(rows: Sequence[Row], max_rows: int) -> Iterable[tuple[bytes, int]]:
+    """Yield compact SurrealQL INSERT bodies bounded by rows and encoded payload bytes."""
+    prefix = b"INSERT INTO item ["
+    suffix = b"] RETURN NONE;"
+    encoded_rows: list[bytes] = []
+    encoded_bytes = 0
+    for row_id, tenant, vector in rows:
+        encoded = json.dumps({
+            "source_id": row_id,
+            "tenant": tenant,
+            "embedding": np.asarray(vector, dtype=np.float32).tolist(),
+        }, separators=(",", ":")).encode()
+        separator_bytes = len(encoded_rows)
+        candidate_bytes = len(prefix) + encoded_bytes + separator_bytes + len(encoded) + len(suffix)
+        if encoded_rows and (len(encoded_rows) >= max_rows or
+                             candidate_bytes >= MAX_LOAD_PAYLOAD_BYTES):
+            yield prefix + b",".join(encoded_rows) + suffix, len(encoded_rows)
+            encoded_rows = []
+            encoded_bytes = 0
+        if len(prefix) + len(encoded) + len(suffix) >= MAX_LOAD_PAYLOAD_BYTES:
+            raise ValueError("one SurrealDB load row exceeds the request payload bound")
+        encoded_rows.append(encoded)
+        encoded_bytes += len(encoded)
+    if encoded_rows:
+        yield prefix + b",".join(encoded_rows) + suffix, len(encoded_rows)
 
 
 def _free_port() -> int:
@@ -63,6 +93,18 @@ class SurrealDBEngine(Engine):
             if statement.get("status") != "OK":
                 raise RuntimeError(f"SurrealDB statement failed: {statement}")
         return statements
+
+    def _sql(self, body: bytes) -> None:
+        """Execute one payload-bounded plain-text SurrealQL request."""
+        response = self._client.post(
+            f"http://127.0.0.1:{self.port}/sql", content=body,
+            headers={"content-type": "text/plain", "accept": "application/json"},
+        )
+        response.raise_for_status()
+        statements = cast(list[dict[str, object]], response.json())
+        for statement in statements:
+            if statement.get("status") != "OK":
+                raise RuntimeError(f"SurrealDB statement failed: {statement}")
 
     def _ensure_namespace(self) -> None:
         response = httpx.post(f"http://127.0.0.1:{self.port}/rpc", timeout=self.timeout,
@@ -178,7 +220,7 @@ class SurrealDBEngine(Engine):
         self.process = None
 
     def load(self, rows: Iterable[Sequence[Row]]) -> PhaseStats:
-        """Define HNSW first, then maintain it during batched inserts."""
+        """Maintain HNSW during bounded, four-worker plain-SQL inserts."""
         self._ensure_namespace()
         schema = f"""
             DEFINE TABLE item SCHEMAFULL;
@@ -192,15 +234,33 @@ class SurrealDBEngine(Engine):
         self._rpc(schema)
         started = time.perf_counter()
         count = 0
-        for batch in rows:
-            payload = [{"source_id": row_id, "tenant": tenant,
-                        "embedding": np.asarray(vector, dtype=np.float32).tolist()}
-                       for row_id, tenant, vector in batch]
-            self._rpc("INSERT INTO item $rows;", {"rows": payload})
-            count += len(batch)
+        max_body_bytes = 0
+        max_body_rows = 0
+        pending: dict[concurrent.futures.Future[None], int] = {}
+        with concurrent.futures.ThreadPoolExecutor(max_workers=LOAD_WORKERS) as pool:
+            for batch in rows:
+                for body, body_rows in _insert_bodies(batch, max_rows=len(batch)):
+                    max_body_bytes = max(max_body_bytes, len(body))
+                    max_body_rows = max(max_body_rows, body_rows)
+                    pending[pool.submit(self._sql, body)] = body_rows
+                    if len(pending) >= LOAD_WORKERS * 2:
+                        finished, _ = concurrent.futures.wait(
+                            pending, return_when=concurrent.futures.FIRST_COMPLETED,
+                        )
+                        for future in finished:
+                            count += pending.pop(future)
+                            future.result()
+            for future in concurrent.futures.as_completed(pending):
+                count += pending[future]
+                future.result()
         elapsed = time.perf_counter() - started
         return PhaseStats(elapsed, count, self.disk_bytes(), {
             "index_maintained_during_load": True,
+            "endpoint": "/sql",
+            "load_workers": LOAD_WORKERS,
+            "max_request_rows": max_body_rows,
+            "max_request_bytes": max_body_bytes,
+            "request_payload_limit_bytes": MAX_LOAD_PAYLOAD_BYTES,
             "hnsw_parameters": {
                 "m": 12, "ef_construction": 150, "m0": 24,
                 "lm": "automatically derived", "source": "SurrealDB defaults",

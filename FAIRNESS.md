@@ -32,6 +32,20 @@ and then builds HNSW. The harness reports insert throughput, index-build time, a
 time-to-queryable separately. The cross-engine comparison uses total time-to-queryable; raw load
 rate alone is not presented as equivalent work.
 
+`batch_size` is the maximum row count handed to both adapters. SurrealDB sends compact plain-text
+`/sql` inserts with four in-flight workers and splits a configured batch further when its encoded
+request would reach 4 MiB. The standard ladder uses 200 rows per configured batch, matching the
+gentle control-loader shape. PostgreSQL consumes the same row batches but writes them into one
+streaming COPY transaction; COPY chunk boundaries are client buffering units, not independently
+parsed server statements, so request concurrency is not analogous there.
+
+SurrealDB ingestion memory is load-pattern-sensitive. The first full ladder used 500-row JSON-RPC
+variable inserts and reached 47.4 GiB RSS at 834k rows, while the control's 200-row, four-worker
+`/sql` pattern completed the same 1M-row source corpus at 12.8 GiB RSS. This harness deliberately
+uses the gentler bounded pattern so indexing and query phases can execute. The aggressive-pattern
+behavior remains a real result and deserves a dedicated future ingestion-pattern phase; it is not
+discarded or presented as though it did not happen.
+
 ## Memory
 
 The sampler walks each engine's Linux process tree every two seconds. It records summed RSS and,
@@ -39,6 +53,8 @@ when `/proc/<pid>/smaps_rollup` is readable, summed proportional set size (PSS).
 multi-process server, so its summed RSS double-counts shared pages; PSS is the primary comparison
 and both values are retained. SurrealDB is normally a single process, but receives exactly the
 same accounting. Docker container PIDs are resolved from the host. Samples are phase-labeled.
+PostgreSQL keeps one client backend alive throughout query suites, as the control harness does, so
+the postmaster and its query backend are simultaneously present when the sampler walks descendants.
 
 Every engine starts under the same configured OS memory cap. `systemd-run --user --scope` with
 `MemoryMax` is preferred for local processes; an address-space `ulimit` fallback is used where a
@@ -72,6 +88,29 @@ Each adapter uses its engine's documented idiomatic ANN form rather than forcing
 These may use pre- or post-filtering differently. Exact eligible-subset recall and underfill are
 reported precisely so that behavior remains observable.
 
+## Relationship to the reference control
+
+The reference `vector-bench` corpus is not the same workload as this ladder's default corpus. It
+uses seed 7423, 100 clusters, and cluster noise sigma 0.01; the ladder defaults use seed 20250308,
+50 clusters, and sigma 0.12. Both normalize centers, corpus vectors, and center-plus-noise query
+vectors, but the control creates a separate 100-query set per tier whereas the ladder deliberately
+reuses one query set across selectivities for paired comparisons. Tenant assignment is independent
+of vector cluster in both. The control assigns additional 50% and many small-background tenants;
+the ladder assigns disjoint 10%, 1%, and 0.1% tenants plus one background label.
+
+Those distribution choices explain why PostgreSQL ef=40 unfiltered recall at 1M is not expected to
+match the control's 0.606. In an audited sample, the nearest corpus cosine was 0.923 in the tight
+control distribution and only 0.175 in the ladder distribution. An independent exact scan matched
+the ladder's stored ground-truth top 10, ruling out tier or truth-subset mislabeling. This is a
+legitimate configured workload difference, not an engine comparison.
+
+Methodology otherwise agrees on post-index `ANALYZE`, per-session `hnsw.ef_search`, cosine distance,
+and PostgreSQL HNSW construction values `m=16, ef_construction=64` (now explicit in the ladder).
+The control also configures 8 GiB `shared_buffers`, 8 GiB `maintenance_work_mem`, and a long-lived
+suite backend; the ladder leaves PostgreSQL memory settings at server defaults under its common
+cell cap. Its roughly 5.6 GiB control query PSS is therefore useful for validating full-tree
+accounting, but is not a target memory value for the differently configured ladder server.
+
 ## Versions and host evidence
 
 Container tags are pinned to `surrealdb/surrealdb:v3.2.1` and `pgvector/pgvector:pg17`; binary
@@ -79,4 +118,3 @@ SurrealDB downloads are pinned and checksum-verified. Runtime server and extensi
 recorded rather than inferred from tags. Every result directory includes the normalized config,
 its SHA-256 hash, `lscpu`, `/proc/meminfo`, platform data, and timestamps. Comparisons from
 different machines or configs must not be merged into one line.
-

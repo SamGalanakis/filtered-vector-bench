@@ -53,6 +53,28 @@ class CellContext:
         return f"{self.engine_name}-d{self.dimensions}-n{self.n_docs}"
 
 
+def _failure_phase(phase: str) -> str:
+    """Collapse detailed sampler phases into stable failure-phase labels."""
+    if phase.startswith("load"):
+        return "load"
+    if phase.startswith("index_build"):
+        return "index_build"
+    if phase.startswith(("pre_churn", "post_churn")):
+        return "filtered_suite"
+    if phase.startswith("churn"):
+        return "churn"
+    if phase.startswith("cold_"):
+        return "cold_open"
+    return phase.split(":", 1)[0]
+
+
+def _classify_failure(*, oom_detected: bool, engine_alive: bool, peak_rss_bytes: int,
+                      memory_cap_bytes: int) -> str:
+    """Classify explicit OOMs and near-cap process disappearance as cap exceedance."""
+    near_cap = abs(peak_rss_bytes - memory_cap_bytes) <= int(memory_cap_bytes * 0.05)
+    return "exceeded_memory_cap" if oom_detected or (not engine_alive and near_cap) else "error"
+
+
 def _command_output(command: list[str]) -> str:
     try:
         return subprocess.run(command, text=True, capture_output=True, timeout=30).stdout
@@ -156,6 +178,8 @@ class BenchmarkRunner:
                         milestone_index += 1
 
             load_stats = engine.load(tracked_rows())
+            sampler.sample_now()
+            load_peak_rss, load_peak_pss = sampler.peak_bytes("load")
             context.phase = "index_build"
             index_stats = engine.build_index()
             total_queryable = load_stats.seconds + index_stats.seconds
@@ -166,7 +190,11 @@ class BenchmarkRunner:
                               index_seconds=index_stats.seconds,
                               time_to_queryable_seconds=total_queryable,
                               disk_bytes=engine.disk_bytes(), load_details=load_stats.details,
-                              index_details=index_stats.details)
+                              index_details=index_stats.details,
+                              load_peak_rss_bytes=load_peak_rss,
+                              load_peak_pss_bytes=load_peak_pss,
+                              peak_rss_bytes=load_peak_rss,
+                              peak_pss_bytes=load_peak_pss)
             self.events.write("engine_versions", cell_id=context.cell_id, versions=engine.version())
 
             context.phase = "settle"
@@ -205,10 +233,18 @@ class BenchmarkRunner:
             self.events.write("cell_complete", cell_id=context.cell_id, outcome="ok",
                               disk_bytes=engine.disk_bytes())
         except Exception as error:
-            outcome = "exceeded_memory_cap" if self._oom_detected(engine) else "error"
+            sampler.sample_now()
+            peak_rss, peak_pss = sampler.peak_bytes()
+            outcome = _classify_failure(
+                oom_detected=self._oom_detected(engine), engine_alive=engine.alive(),
+                peak_rss_bytes=peak_rss, memory_cap_bytes=self.config.memory_cap_bytes,
+            )
+            failure_phase = _failure_phase(context.phase)
             self.events.write("cell_complete", cell_id=context.cell_id, outcome=outcome,
                               error=repr(error), traceback=traceback.format_exc(),
-                              memory_cap_bytes=self.config.memory_cap_bytes)
+                              memory_cap_bytes=self.config.memory_cap_bytes,
+                              phase=failure_phase, failure_phase=failure_phase,
+                              peak_rss_bytes=peak_rss, peak_pss_bytes=peak_pss)
         finally:
             sampler.stop()
             try:
@@ -239,6 +275,7 @@ class BenchmarkRunner:
                     underfills = 0
                     context.phase = f"{label}:s{selectivity}:ef{ef}:{mode}:queries"
                     sampler.sample_now()
+                    result_counts: list[int] = []
                     for query_index, vector in enumerate(queries):
                         ids, wall = engine.query(vector, tenant, self.config.k, ef, mode)
                         recall = recall_at_k(ids, exact[query_index], self.config.k)
@@ -246,6 +283,7 @@ class BenchmarkRunner:
                         latencies.append(wall)
                         recalls.append(recall)
                         underfills += int(underfill)
+                        result_counts.append(len(ids))
                         self.queries.write("query", cell_id=context.cell_id, suite_id=suite_id,
                                            label=label, selectivity=selectivity, ef=ef, mode=mode,
                                            query_index=query_index, latency_seconds=wall,
@@ -253,12 +291,16 @@ class BenchmarkRunner:
                                            underfill=underfill, source_ids=ids)
                     sampler.sample_now()
                     self.events.write("suite_complete", cell_id=context.cell_id, suite_id=suite_id,
-                                      label=label, selectivity=selectivity, ef=ef, mode=mode,
-                                      n_queries=len(latencies), p50_seconds=float(np.percentile(latencies, 50)),
-                                      p95_seconds=float(np.percentile(latencies, 95)),
+                                      label=label, tier=tenant or "unfiltered",
+                                      selectivity=selectivity, ef=ef, mode=mode,
+                                      n_queries=len(latencies),
+                                      p50_ms=1000 * float(np.percentile(latencies, 50)),
+                                      p95_ms=1000 * float(np.percentile(latencies, 95)),
                                       mean_recall_at_10=float(np.mean(recalls)),
+                                      underfill=underfills,
                                       underfill_percent=100 * underfills / len(latencies),
-                                      uses_vector_index=uses_index)
+                                      mean_result_count=float(np.mean(result_counts)),
+                                      plan=plan, plan_uses_index=uses_index)
 
     def _churn(self, context: CellContext, engine: Engine,
                artifacts: DataArtifacts,

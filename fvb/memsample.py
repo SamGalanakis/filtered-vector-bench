@@ -50,6 +50,7 @@ class MemorySampler:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._write_lock = threading.Lock()
+        self._peaks: dict[str, tuple[int, int]] = {}
 
     def start(self) -> None:
         """Start sampling in a daemon thread."""
@@ -67,6 +68,14 @@ class MemorySampler:
         """Capture a phase-boundary sample in addition to the fixed cadence."""
         self._sample()
 
+    def peak_bytes(self, phase_prefix: str | None = None) -> tuple[int, int]:
+        """Return peak summed RSS and PSS, optionally restricted to a phase prefix."""
+        with self._write_lock:
+            samples = [value for phase, value in self._peaks.items()
+                       if phase_prefix is None or phase.startswith(phase_prefix)]
+        return (max((value[0] for value in samples), default=0),
+                max((value[1] for value in samples), default=0))
+
     def _run(self) -> None:
         while not self._stop.is_set():
             self._sample()
@@ -79,7 +88,10 @@ class MemorySampler:
                 pids.update(_children(root))
         rss = sum(_kib(pid, "status", "VmRSS") for pid in pids) * 1024
         pss = sum(_kib(pid, "smaps_rollup", "Pss") for pid in pids) * 1024
+        phase = self.phase()
         with self._write_lock:
+            old_rss, old_pss = self._peaks.get(phase, (0, 0))
+            self._peaks[phase] = (max(old_rss, rss), max(old_pss, pss))
             exists = self.path.exists() and self.path.stat().st_size > 0
             with self.path.open("a", newline="", encoding="utf-8") as handle:
                 writer = csv.DictWriter(handle, fieldnames=(
@@ -88,5 +100,5 @@ class MemorySampler:
                 if not exists:
                     writer.writeheader()
                 writer.writerow({"unix_time": time.time(), "monotonic_seconds": time.monotonic(),
-                                 "phase": self.phase(), "pids": ";".join(map(str, sorted(pids))),
+                                 "phase": phase, "pids": ";".join(map(str, sorted(pids))),
                                  "rss_bytes": rss, "pss_bytes": pss})

@@ -7,7 +7,7 @@ n_queries: 8
 k: 10
 clusters: 16
 cluster_sigma: 0.12
-batch_size: 250
+batch_size: 200
 settle_seconds: 1
 client_timeout_seconds: 120
 memory_cap_gib: 4
@@ -20,9 +20,7 @@ churn:
   target_ops_per_second: 10
 engines:
   surrealdb:
-    mode: docker
-    image: surrealdb/surrealdb:v3.2.1
+    mode: binary
+    version: v3.2.1
   postgres:
-    mode: docker
-    image: pgvector/pgvector:pg17
-
+    mode: local

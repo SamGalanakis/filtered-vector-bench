@@ -7,7 +7,7 @@ n_queries: 100
 k: 10
 clusters: 50
 cluster_sigma: 0.12
-batch_size: 500
+batch_size: 200
 settle_seconds: 120
 client_timeout_seconds: 120
 memory_cap_gib: 48
@@ -25,4 +25,3 @@ engines:
   postgres:
     mode: local
     image: pgvector/pgvector:pg17
-

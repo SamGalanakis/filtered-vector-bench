@@ -8,7 +8,7 @@ import socket
 import subprocess
 import time
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Any, Iterable, Sequence
 
 import numpy as np
 import psycopg
@@ -40,6 +40,7 @@ class PostgresEngine(Engine):
         self.port = _free_port()
         self.container = f"fvb-postgres-{self.port}"
         self.process: subprocess.Popen[bytes] | None = None
+        self._query_connection: psycopg.Connection[Any] | None = None
         self.pgdata = workdir / "data"
         self.dsn = f"host=127.0.0.1 port={self.port} dbname=postgres user=postgres"
 
@@ -101,6 +102,9 @@ class PostgresEngine(Engine):
 
     def stop(self) -> None:
         """Stop the server while retaining its cluster."""
+        if self._query_connection is not None:
+            self._query_connection.close()
+            self._query_connection = None
         if self.settings.mode == "docker":
             subprocess.run(["docker", "stop", "-t", "30", self.container], capture_output=True)
         elif self.process and self.process.poll() is None:
@@ -134,7 +138,10 @@ class PostgresEngine(Engine):
         """Build HNSW after load using pgvector defaults."""
         started = time.perf_counter()
         with psycopg.connect(self.dsn, autocommit=True) as connection:
-            connection.execute("CREATE INDEX item_embedding_hnsw_idx ON item USING hnsw (embedding vector_cosine_ops)")
+            connection.execute("""
+                CREATE INDEX item_embedding_hnsw_idx ON item
+                USING hnsw (embedding vector_cosine_ops) WITH (m=16, ef_construction=64)
+            """)
             connection.execute("ANALYZE item")
         elapsed = time.perf_counter() - started
         return PhaseStats(elapsed, disk_bytes=self.disk_bytes(), details={
@@ -150,27 +157,33 @@ class PostgresEngine(Engine):
         where = "WHERE tenant = %s " if tenant is not None else ""
         return f"{prefix}SELECT source_id FROM item {where}ORDER BY embedding <=> %s::vector LIMIT {k}"
 
+    def _query_session(self) -> psycopg.Connection[Any]:
+        """Keep one backend alive so query-phase process-tree samples include it."""
+        if self._query_connection is None or self._query_connection.closed:
+            self._query_connection = psycopg.connect(self.dsn, autocommit=True)
+            self._query_connection.execute(f"SET statement_timeout = '{int(self.timeout)}s'")
+        return self._query_connection
+
     def query(self, vector: NDArray[np.float32], tenant: str | None, k: int, ef: int,
               mode: str = "default") -> tuple[list[int], float]:
         """Run an idiomatic pgvector cosine query with session search settings."""
         args = (tenant, _vector(vector)) if tenant is not None else (_vector(vector),)
-        with psycopg.connect(self.dsn) as connection:
-            connection.execute(f"SET statement_timeout = '{int(self.timeout)}s'")
-            connection.execute(f"SET hnsw.ef_search = {int(ef)}")
-            connection.execute(f"SET hnsw.iterative_scan = {self._mode_value(mode)}")
-            started = time.perf_counter()
-            result = connection.execute(self._sql(tenant, k), args).fetchall()
-            elapsed = time.perf_counter() - started
+        connection = self._query_session()
+        connection.execute(f"SET hnsw.ef_search = {int(ef)}")
+        connection.execute(f"SET hnsw.iterative_scan = {self._mode_value(mode)}")
+        started = time.perf_counter()
+        result = connection.execute(self._sql(tenant, k), args).fetchall()
+        elapsed = time.perf_counter() - started
         return [int(row[0]) for row in result], elapsed
 
     def explain(self, vector: NDArray[np.float32], tenant: str | None, k: int, ef: int,
                 mode: str = "default") -> str:
         """Capture JSON EXPLAIN for the exact query and session settings."""
         args = (tenant, _vector(vector)) if tenant is not None else (_vector(vector),)
-        with psycopg.connect(self.dsn) as connection:
-            connection.execute(f"SET hnsw.ef_search = {int(ef)}")
-            connection.execute(f"SET hnsw.iterative_scan = {self._mode_value(mode)}")
-            plan = connection.execute(self._sql(tenant, k, explain=True), args).fetchone()
+        connection = self._query_session()
+        connection.execute(f"SET hnsw.ef_search = {int(ef)}")
+        connection.execute(f"SET hnsw.iterative_scan = {self._mode_value(mode)}")
+        plan = connection.execute(self._sql(tenant, k, explain=True), args).fetchone()
         if plan is None:
             raise RuntimeError("PostgreSQL EXPLAIN returned no row")
         return json.dumps(plan[0], sort_keys=True)

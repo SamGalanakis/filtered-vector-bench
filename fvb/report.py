@@ -7,7 +7,7 @@ import json
 import math
 from collections import defaultdict
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import matplotlib
 
@@ -16,6 +16,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.axes import Axes
 from matplotlib.figure import Figure
+from matplotlib.lines import Line2D
 from matplotlib.patches import Patch, PathPatch
 from matplotlib.path import Path as PlotPath
 
@@ -23,7 +24,8 @@ from matplotlib.path import Path as PlotPath
 COLORS = {"surrealdb": "#2a78d6", "postgres": "#008300"}
 DISPLAY = {"surrealdb": "SurrealDB", "postgres": "PostgreSQL"}
 FAILURE = "#e34948"
-EF_STYLES = {40: "-", 64: "--"}
+EF_STYLES: dict[int, Literal["-", "--"]] = {40: "-", 64: "--"}
+MODE_MARKERS = {"default": "o", "strict_order": "s", "relaxed_order": "^"}
 
 
 def _jsonl(path: Path) -> list[dict[str, Any]]:
@@ -45,6 +47,23 @@ def _cell_parts(cell_id: str) -> tuple[str, int, int]:
 
 def _number(value: float | None) -> str:
     return "—" if value is None else f"{value:,.3f}"
+
+
+def _normalized_suite(row: dict[str, Any]) -> dict[str, Any]:
+    """Read both the current self-describing suite schema and historical events."""
+    normalized = dict(row)
+    selectivity = float(normalized["selectivity"])
+    normalized.setdefault("tier", "unfiltered" if selectivity == 1.0 else
+                          f"tenant_s{format(selectivity, '.8g').replace('.', '_')}")
+    normalized.setdefault("p50_ms", 1000 * float(normalized.get("p50_seconds", 0.0)))
+    normalized.setdefault("p95_ms", 1000 * float(normalized.get("p95_seconds", 0.0)))
+    normalized.setdefault("underfill", round(
+        float(normalized.get("underfill_percent", 0.0)) * int(normalized.get("n_queries", 0)) / 100
+    ))
+    normalized.setdefault("mean_result_count", None)
+    normalized.setdefault("plan", "See plans.jsonl (historical event schema)")
+    normalized.setdefault("plan_uses_index", normalized.get("uses_vector_index", False))
+    return normalized
 
 
 def _apply_style(axis: Axes, title: str, xlabel: str, ylabel: str) -> None:
@@ -104,119 +123,232 @@ def _plot_series(axis: Axes, rows: list[dict[str, Any]], value: str) -> None:
         y = [float(item[value]) for item in points]
         label = f"{DISPLAY[engine]} ef={ef}" + ("" if mode == "default" else f" {mode}")
         axis.plot(x, y, color=COLORS[engine], linestyle=EF_STYLES.get(ef, "-."),
-                  linewidth=2, marker="o", markersize=8, label=label)
-        if x and math.isfinite(y[-1]):
+                  linewidth=2, marker=MODE_MARKERS.get(mode, "o"), markersize=8,
+                  label="_nolegend_")
+        if len(series) <= 4 and x and math.isfinite(y[-1]):
             vertical_offset = (series_index - (len(series) - 1) / 2) * 11
             axis.annotate(label, (x[-1], y[-1]), xytext=(5, vertical_offset),
                           textcoords="offset points",
                           color=COLORS[engine], fontsize=8, va="center")
 
 
-def _selectivity_figures(suites: list[dict[str, Any]], charts: Path) -> None:
+def _series_legend(axis: Axes, rows: list[dict[str, Any]]) -> None:
+    """Use one compact visual-key legend instead of one entry per PG series."""
+    engines = sorted({_engine(row["cell_id"]) for row in rows})
+    efs = sorted({int(row["ef"]) for row in rows})
+    modes = [mode for mode in MODE_MARKERS
+             if any(_engine(row["cell_id"]) == "postgres" and row.get("mode") == mode
+                    for row in rows)]
+    handles: list[Line2D] = [
+        Line2D([], [], color=COLORS[engine], linewidth=2, label=DISPLAY[engine])
+        for engine in engines
+    ]
+    handles.extend(Line2D([], [], color="#4b5563", linestyle=EF_STYLES.get(ef, "-."),
+                          linewidth=2, label=f"ef={ef}") for ef in efs)
+    handles.extend(Line2D([], [], color="#4b5563", linestyle="None",
+                          marker=MODE_MARKERS[mode], markersize=7,
+                          label=f"PG {mode.replace('_', ' ')}") for mode in modes)
+    if handles:
+        axis.legend(handles=handles, frameon=False, fontsize=8, ncol=2)
+
+
+def _legend_if_present(axis: Axes) -> None:
+    handles, _ = axis.get_legend_handles_labels()
+    if handles:
+        axis.legend(frameon=False)
+
+
+def _failure_text(row: dict[str, Any], engine: str) -> str:
+    phase = str(row.get("failure_phase", row.get("phase", "unknown phase")))
+    if row.get("outcome") == "exceeded_memory_cap":
+        reason = f"exceeded memory cap during {phase}"
+    else:
+        reason = f"failed during {phase}"
+    return f"{DISPLAY[engine]}: no data — {reason} at this scale"
+
+
+def _annotate_missing(axis: Axes, rows: list[dict[str, Any]], outcomes: dict[str, dict[str, Any]],
+                      dimension: int, n_docs: int, vertical_slot: int = 0) -> None:
+    missing: list[str] = []
+    present = {_engine(row["cell_id"]) for row in rows}
+    for engine in COLORS:
+        cell = f"{engine}-d{dimension}-n{n_docs}"
+        outcome = outcomes.get(cell)
+        if engine not in present and outcome and outcome.get("outcome") != "ok":
+            missing.append(_failure_text(outcome, engine))
+    for index, message in enumerate(missing):
+        axis.text(0.02, 0.03 + (vertical_slot * len(COLORS) + index) * 0.07, message,
+                  transform=axis.transAxes,
+                  color=FAILURE, fontsize=8, va="bottom")
+
+
+def _selectivity_figures(suites: list[dict[str, Any]], outcomes: dict[str, dict[str, Any]],
+                         charts: Path) -> None:
     pre = [row for row in suites if row.get("label") == "pre_churn"]
-    dimensions = sorted({_cell_parts(row["cell_id"])[1] for row in pre})
+    all_cells = {row["cell_id"] for row in pre} | set(outcomes)
+    dimensions = sorted({_cell_parts(cell)[1] for cell in all_cells})
     for dimension in dimensions:
-        scales = sorted({_cell_parts(row["cell_id"])[2] for row in pre
-                         if _cell_parts(row["cell_id"])[1] == dimension})
+        scales = sorted({_cell_parts(cell)[2] for cell in all_cells
+                         if _cell_parts(cell)[1] == dimension})
         figure, axes = plt.subplots(1, len(scales), figsize=(6.5 * len(scales), 4.8), squeeze=False)
         for axis, n_docs in zip(axes[0], scales):
             rows = [row for row in pre if _cell_parts(row["cell_id"])[1:] == (dimension, n_docs)]
             _plot_series(axis, rows, "mean_recall_at_10")
-            _apply_style(axis, f"{n_docs:,} vectors", "Eligible corpus (%)", "Recall@10")
+            _apply_style(axis, f"{n_docs:,} vectors",
+                         "filter selectivity (% of corpus eligible)", "Recall@10")
             axis.set_xscale("log")
             axis.invert_xaxis()
             axis.set_ylim(-0.02, 1.02)
-            axis.legend(frameon=False, fontsize=8)
+            _series_legend(axis, rows)
+            _annotate_missing(axis, rows, outcomes, dimension, n_docs)
         _save(figure, charts, f"recall-vs-selectivity-d{dimension}")
 
         figure, axes = plt.subplots(2, len(scales), figsize=(6.5 * len(scales), 8.5), squeeze=False)
         for column, n_docs in enumerate(scales):
             rows = [row for row in pre if _cell_parts(row["cell_id"])[1:] == (dimension, n_docs)]
-            for axis, field, percentile in ((axes[0, column], "p50_seconds", "p50"),
-                                             (axes[1, column], "p95_seconds", "p95")):
+            for axis, field, percentile in ((axes[0, column], "p50_ms", "p50"),
+                                             (axes[1, column], "p95_ms", "p95")):
                 _plot_series(axis, rows, field)
                 _apply_style(axis, f"{percentile} · {n_docs:,} vectors",
-                             "Eligible corpus (%)", "Latency (seconds)")
+                             "filter selectivity (% of corpus eligible)", "Latency (ms)")
                 axis.set_xscale("log")
                 axis.invert_xaxis()
                 axis.set_yscale("log")
-                axis.legend(frameon=False, fontsize=8)
+                _series_legend(axis, rows)
+                _annotate_missing(axis, rows, outcomes, dimension, n_docs)
         _save(figure, charts, f"latency-vs-selectivity-d{dimension}")
 
         figure, axes = plt.subplots(1, len(scales), figsize=(6.5 * len(scales), 4.8), squeeze=False)
         for axis, n_docs in zip(axes[0], scales):
             rows = [row for row in pre if _cell_parts(row["cell_id"])[1:] == (dimension, n_docs)]
             _plot_series(axis, rows, "underfill_percent")
-            _apply_style(axis, f"{n_docs:,} vectors", "Eligible corpus (%)", "Underfill (%)")
+            _apply_style(axis, f"{n_docs:,} vectors",
+                         "filter selectivity (% of corpus eligible)", "Underfill (%)")
             axis.set_xscale("log")
             axis.invert_xaxis()
             axis.set_ylim(bottom=0)
-            axis.legend(frameon=False, fontsize=8)
+            _series_legend(axis, rows)
+            _annotate_missing(axis, rows, outcomes, dimension, n_docs)
         _save(figure, charts, f"underfill-vs-selectivity-d{dimension}")
 
 
-def _memory_peaks(results: Path) -> dict[str, dict[str, float]]:
-    peaks: dict[str, dict[str, float]] = {}
+def _memory_peaks(results: Path) -> dict[str, dict[str, float | str]]:
+    peaks: dict[str, dict[str, float | str]] = {}
     for memory_file in (results / "cells").glob("*/memory.csv") if (results / "cells").exists() else []:
         cell_id = memory_file.parent.name
-        peak_rss = peak_pss = 0.0
+        peak_rss = peak_pss = load_rss = load_pss = overall_rss = overall_pss = 0.0
+        peak_phase = "unknown"
         with memory_file.open(encoding="utf-8") as handle:
             for row in csv.DictReader(handle):
+                rss = float(row["rss_bytes"])
+                pss = float(row["pss_bytes"])
+                if rss > overall_rss:
+                    peak_phase = row["phase"]
+                overall_rss = max(overall_rss, rss)
+                overall_pss = max(overall_pss, pss)
+                if row["phase"].startswith("load"):
+                    load_rss = max(load_rss, rss)
+                    load_pss = max(load_pss, pss)
                 if "queries" in row["phase"] or row["phase"] == "churn":
-                    peak_rss = max(peak_rss, float(row["rss_bytes"]))
-                    peak_pss = max(peak_pss, float(row["pss_bytes"]))
-        peaks[cell_id] = {"rss": peak_rss, "pss": peak_pss or peak_rss}
+                    peak_rss = max(peak_rss, rss)
+                    peak_pss = max(peak_pss, pss)
+        peaks[cell_id] = {
+            "rss": peak_rss, "pss": peak_pss or peak_rss,
+            "load_rss": load_rss, "load_pss": load_pss or load_rss,
+            "overall_rss": overall_rss, "overall_pss": overall_pss or overall_rss,
+            "peak_phase": peak_phase,
+        }
     return peaks
 
 
-def _scale_charts(events: list[dict[str, Any]], results: Path, charts: Path) -> None:
+def _phase_label(phase: str) -> str:
+    if phase.startswith("load"):
+        return "load"
+    if phase.startswith(("pre_churn", "post_churn")):
+        return "filtered_suite"
+    return phase.split(":", 1)[0]
+
+
+def _effective_outcomes(events: list[dict[str, Any]],
+                        peaks: dict[str, dict[str, float | str]]) -> dict[str, dict[str, Any]]:
+    """Upgrade historical near-cap disconnects for faithful report rendering."""
+    outcomes = {row["cell_id"]: dict(row) for row in events if row["event"] == "cell_complete"}
+    for cell, row in outcomes.items():
+        peak = peaks.get(cell, {})
+        cap = int(row.get("memory_cap_bytes", 0))
+        overall_rss = float(peak.get("overall_rss", 0.0))
+        near_cap = cap and abs(overall_rss - cap) <= cap * 0.05
+        if row.get("outcome") == "error" and near_cap:
+            row["outcome"] = "exceeded_memory_cap"
+            row["failure_phase"] = _phase_label(str(peak.get("peak_phase", "unknown")))
+    return outcomes
+
+
+def _scale_charts(events: list[dict[str, Any]], charts: Path,
+                  outcomes: dict[str, dict[str, Any]],
+                  peaks: dict[str, dict[str, float | str]]) -> None:
     loads = {row["cell_id"]: row for row in events if row["event"] == "load_complete"}
     colds: dict[str, list[float]] = defaultdict(list)
     for row in events:
         if row["event"] == "cold_open":
             colds[row["cell_id"]].append(float(row["time_to_first_query_seconds"]))
-    outcomes = {row["cell_id"]: row for row in events if row["event"] == "cell_complete"}
-    peaks = _memory_peaks(results)
     cells = set(loads) | set(outcomes) | set(peaks)
     dimensions = sorted({_cell_parts(cell)[1] for cell in cells})
     for dimension in dimensions:
         dimension_cells = [cell for cell in cells if _cell_parts(cell)[1] == dimension]
         figure, axis = plt.subplots(figsize=(7.5, 5))
-        for engine in COLORS:
-            points = sorted(((_cell_parts(cell)[2], peaks[cell]["pss"] / 1024**3)
-                             for cell in dimension_cells if _engine(cell) == engine and cell in peaks))
+        for engine_index, engine in enumerate(COLORS):
+            points = sorted(((_cell_parts(cell)[2], float(peaks[cell]["pss"]) / 1024**3)
+                             for cell in dimension_cells if _engine(cell) == engine and cell in peaks
+                             and float(peaks[cell]["pss"]) > 0
+                             and outcomes.get(cell, {}).get("outcome", "ok") == "ok"))
             if points:
                 axis.plot(*zip(*points), color=COLORS[engine], linewidth=2, marker="o", markersize=8,
                           label=DISPLAY[engine])
-                axis.annotate(DISPLAY[engine], points[-1], xytext=(5, 0), textcoords="offset points",
+                offset = (engine_index - (len(COLORS) - 1) / 2) * 12
+                axis.annotate(DISPLAY[engine], points[-1], xytext=(5, offset),
+                              textcoords="offset points",
                               color=COLORS[engine], va="center")
         for cell, row in outcomes.items():
             engine, dims, n_docs = _cell_parts(cell)
-            if dims == dimension and row.get("outcome") == "exceeded_memory_cap":
+            if dims == dimension and row.get("outcome") != "ok":
                 cap = float(row["memory_cap_bytes"]) / 1024**3
                 axis.scatter([n_docs], [cap], color=FAILURE, marker="x", s=90, linewidths=2, zorder=5)
-                axis.annotate("exceeded cap", (n_docs, cap), xytext=(5, 5), textcoords="offset points",
+                phase = str(row.get("failure_phase", row.get("phase", "unknown phase")))
+                label = (f"exceeded cap during {phase}" if
+                         row.get("outcome") == "exceeded_memory_cap" else f"failed during {phase}")
+                axis.annotate(label, (n_docs, cap), xytext=(5, 5), textcoords="offset points",
                               color=FAILURE, fontsize=9)
         _apply_style(axis, "Peak query-phase process-tree memory", "Vectors",
                      "PSS (GiB; RSS fallback)")
         axis.set_xscale("log")
-        axis.legend(frameon=False)
+        _legend_if_present(axis)
         _save(figure, charts, f"memory-vs-scale-d{dimension}")
 
         figure, axis = plt.subplots(figsize=(7.5, 5))
-        for engine in COLORS:
+        for engine_index, engine in enumerate(COLORS):
             points = sorted(((_cell_parts(cell)[2], float(np.median(colds[cell])))
                              for cell in colds if _engine(cell) == engine and
-                             _cell_parts(cell)[1] == dimension))
+                             _cell_parts(cell)[1] == dimension and
+                             outcomes.get(cell, {}).get("outcome", "ok") == "ok"))
             if points:
                 axis.plot(*zip(*points), color=COLORS[engine], linewidth=2, marker="o", markersize=8,
                           label=DISPLAY[engine])
-                axis.annotate(DISPLAY[engine], points[-1], xytext=(5, 0), textcoords="offset points",
+                offset = (engine_index - (len(COLORS) - 1) / 2) * 12
+                axis.annotate(DISPLAY[engine], points[-1], xytext=(5, offset),
+                              textcoords="offset points",
                               color=COLORS[engine], va="center")
+        cold_rows = [{"cell_id": cell} for cell in colds
+                     if _cell_parts(cell)[1] == dimension and
+                     outcomes.get(cell, {}).get("outcome", "ok") == "ok"]
+        for slot, n_docs in enumerate(sorted({_cell_parts(cell)[2] for cell in dimension_cells})):
+            _annotate_missing(axis, [row for row in cold_rows
+                                     if _cell_parts(row["cell_id"])[2] == n_docs],
+                              outcomes, dimension, n_docs, slot)
         _apply_style(axis, "Time to first query after restart", "Vectors", "Seconds")
         axis.set_xscale("log")
         axis.set_yscale("log")
-        axis.legend(frameon=False)
+        _legend_if_present(axis)
         _save(figure, charts, f"cold-open-vs-scale-d{dimension}")
 
         figure, axes = plt.subplots(1, 2, figsize=(13, 5))
@@ -224,17 +356,28 @@ def _scale_charts(events: list[dict[str, Any]], results: Path, charts: Path) -> 
             (axes[0], "rows_per_second", "Rows / second", "Durable load throughput"),
             (axes[1], "time_to_queryable_seconds", "Seconds", "Total time to queryable"),
         ):
-            for engine in COLORS:
+            for engine_index, engine in enumerate(COLORS):
                 points = sorted(((_cell_parts(cell)[2], float(row[field])) for cell, row in loads.items()
-                                 if _engine(cell) == engine and _cell_parts(cell)[1] == dimension))
+                                 if _engine(cell) == engine and _cell_parts(cell)[1] == dimension
+                                 and outcomes.get(cell, {}).get("outcome", "ok") == "ok"))
                 if points:
                     axis.plot(*zip(*points), color=COLORS[engine], linewidth=2, marker="o", markersize=8,
                               label=DISPLAY[engine])
-                    axis.annotate(DISPLAY[engine], points[-1], xytext=(5, 0), textcoords="offset points",
+                    offset = (engine_index - (len(COLORS) - 1) / 2) * 12
+                    axis.annotate(DISPLAY[engine], points[-1], xytext=(5, offset),
+                                  textcoords="offset points",
                                   color=COLORS[engine], va="center")
+            load_rows = [{"cell_id": cell} for cell in loads
+                         if _cell_parts(cell)[1] == dimension and
+                         outcomes.get(cell, {}).get("outcome", "ok") == "ok"]
+            for slot, n_docs in enumerate(sorted({_cell_parts(cell)[2]
+                                                  for cell in dimension_cells})):
+                _annotate_missing(axis, [row for row in load_rows
+                                         if _cell_parts(row["cell_id"])[2] == n_docs],
+                                  outcomes, dimension, n_docs, slot)
             _apply_style(axis, title, "Vectors", ylabel)
             axis.set_xscale("log")
-            axis.legend(frameon=False)
+            _legend_if_present(axis)
         _save(figure, charts, f"load-vs-scale-d{dimension}")
 
 
@@ -256,14 +399,15 @@ def _churn_charts(suites: list[dict[str, Any]], results: Path, charts: Path) -> 
         memory_series[(dimension, n_docs)].append((engine, rows))
     for (dimension, n_docs), series in sorted(memory_series.items()):
         figure, axis = plt.subplots(figsize=(7.5, 5))
-        for engine, rows in sorted(series):
+        for series_index, (engine, rows) in enumerate(sorted(series)):
             start = float(rows[0]["monotonic_seconds"])
             x = [float(row["monotonic_seconds"]) - start for row in rows]
             y = [(float(row["pss_bytes"]) or float(row["rss_bytes"])) / 1024**3
                  for row in rows]
             axis.plot(x, y, color=COLORS[engine], linewidth=2, marker="o", markersize=8,
                       label=DISPLAY[engine])
-            axis.annotate(DISPLAY[engine], (x[-1], y[-1]), xytext=(5, 0),
+            offset = (series_index - (len(series) - 1) / 2) * 12
+            axis.annotate(DISPLAY[engine], (x[-1], y[-1]), xytext=(5, offset),
                           textcoords="offset points", color=COLORS[engine], va="center")
         _apply_style(axis, f"Churn memory · {n_docs:,} × {dimension}", "Elapsed seconds",
                      "PSS (GiB; RSS fallback)")
@@ -312,11 +456,11 @@ def _churn_charts(suites: list[dict[str, Any]], results: Path, charts: Path) -> 
 
 
 def _markdown(events: list[dict[str, Any]], suites: list[dict[str, Any]], results: Path,
-              peaks: dict[str, dict[str, float]]) -> str:
+              peaks: dict[str, dict[str, float | str]],
+              outcomes: dict[str, dict[str, Any]]) -> str:
     metadata = json.loads((results / "metadata.json").read_text(encoding="utf-8"))
     versions = {row["cell_id"]: row["versions"] for row in events if row["event"] == "engine_versions"}
     loads = {row["cell_id"]: row for row in events if row["event"] == "load_complete"}
-    outcomes = {row["cell_id"]: row for row in events if row["event"] == "cell_complete"}
     colds: dict[str, list[float]] = defaultdict(list)
     for row in events:
         if row["event"] == "cold_open":
@@ -324,32 +468,42 @@ def _markdown(events: list[dict[str, Any]], suites: list[dict[str, Any]], result
     lines = ["# Benchmark summary", "", f"Config SHA-256: `{metadata['config_sha256']}`  ",
              f"Host: `{metadata['hostname']}` · `{metadata['platform']}` · Python `{metadata['python']}`",
              "", "## Cell overview", "",
-             "| Engine | Dims | Vectors | Outcome | Version | Load rows/s | Queryable s | Peak PSS/RSS GiB | Cold first-query s |",
-             "|---|---:|---:|---|---|---:|---:|---:|---:|"]
+             "| Engine | Dims | Vectors | Outcome | Version | Load rows/s | Queryable s | Load peak PSS/RSS GiB | Query peak PSS/RSS GiB | Cold first-query s |",
+             "|---|---:|---:|---|---|---:|---:|---:|---:|---:|"]
     cell_ids = sorted(set(loads) | set(outcomes), key=lambda cell: _cell_parts(cell)[1:])
     for cell in cell_ids:
         engine, dimensions, n_docs = _cell_parts(cell)
         load = loads.get(cell, {})
-        outcome = outcomes.get(cell, {}).get("outcome", "incomplete")
+        outcome_row = outcomes.get(cell, {})
+        outcome = str(outcome_row.get("outcome", "incomplete"))
+        if outcome != "ok" and outcome_row.get("failure_phase"):
+            outcome += f" ({outcome_row['failure_phase']})"
         version = ", ".join(f"{key} {value}" for key, value in versions.get(cell, {}).items()) or "—"
         rows_per_second = load.get("rows_per_second")
         queryable = load.get("time_to_queryable_seconds")
-        pss = peaks.get(cell, {}).get("pss")
+        pss = float(peaks.get(cell, {}).get("pss", 0.0))
+        load_pss = float(load.get("load_peak_pss_bytes") or
+                         peaks.get(cell, {}).get("load_pss", 0.0))
         cold = float(np.median(colds[cell])) if cell in colds else None
         lines.append(f"| {DISPLAY[engine]} | {dimensions} | {n_docs:,} | {outcome} | {version} | "
                      f"{_number(rows_per_second)} | {_number(queryable)} | "
+                     f"{_number(load_pss / 1024**3 if load_pss else None)} | "
                      f"{_number(pss / 1024**3 if pss else None)} | {_number(cold)} |")
     lines += ["", "## Filtered suites", "",
-              "| Engine | Dims | Vectors | Stage | Selectivity | ef | Mode | Index plan | Recall@10 | p50 ms | p95 ms | Underfill |",
-              "|---|---:|---:|---|---:|---:|---|---|---:|---:|---:|---:|"]
+              "| Engine | Dims | Vectors | Stage | Tier | Selectivity | ef | Mode | Index plan | Recall@10 | p50 ms | p95 ms | Underfill | Mean results |",
+              "|---|---:|---:|---|---|---:|---:|---|---|---:|---:|---:|---:|---:|"]
     for row in sorted(suites, key=lambda item: (item["cell_id"], item["label"],
                                                 -float(item["selectivity"]), item["ef"], item["mode"])):
         engine, dimensions, n_docs = _cell_parts(row["cell_id"])
-        gate = "yes" if row["uses_vector_index"] else "**NO**"
+        gate = "yes" if row["plan_uses_index"] else "**NO**"
+        mean_results = row.get("mean_result_count")
+        mean_results_text = "—" if mean_results is None else f"{float(mean_results):.2f}"
         lines.append(f"| {DISPLAY[engine]} | {dimensions} | {n_docs:,} | {row['label']} | "
-                     f"{100 * float(row['selectivity']):g}% | {row['ef']} | {row['mode']} | {gate} | "
-                     f"{float(row['mean_recall_at_10']):.4f} | {1000 * float(row['p50_seconds']):.3f} | "
-                     f"{1000 * float(row['p95_seconds']):.3f} | {float(row['underfill_percent']):.2f}% |")
+                     f"{row['tier']} | {100 * float(row['selectivity']):g}% | {row['ef']} | "
+                     f"{row['mode']} | {gate} | {float(row['mean_recall_at_10']):.4f} | "
+                     f"{float(row['p50_ms']):.3f} | {float(row['p95_ms']):.3f} | "
+                     f"{int(row['underfill'])}/{int(row.get('n_queries', 0))} "
+                     f"({float(row['underfill_percent']):.2f}%) | {mean_results_text} |")
     lines += ["", "## Metadata", "", "```json",
               json.dumps({"config_sha256": metadata["config_sha256"], "versions": versions,
                           "hardware_files": ["lscpu.txt", "meminfo.txt"]}, indent=2, sort_keys=True),
@@ -367,9 +521,13 @@ def generate_report(results: Path) -> None:
         for old_chart in charts.glob(pattern):
             old_chart.unlink()
     events = _jsonl(results / "events.jsonl")
-    suites = [row for row in events if row["event"] == "suite_complete"]
-    _selectivity_figures(suites, charts)
-    _scale_charts(events, results, charts)
-    _churn_charts(suites, results, charts)
     peaks = _memory_peaks(results)
-    (results / "summary.md").write_text(_markdown(events, suites, results, peaks), encoding="utf-8")
+    outcomes = _effective_outcomes(events, peaks)
+    suites = [_normalized_suite(row) for row in events if row["event"] == "suite_complete"
+              and outcomes.get(row["cell_id"], {}).get("outcome", "ok") == "ok"]
+    _selectivity_figures(suites, outcomes, charts)
+    _scale_charts(events, charts, outcomes, peaks)
+    _churn_charts(suites, results, charts)
+    (results / "summary.md").write_text(
+        _markdown(events, suites, results, peaks, outcomes), encoding="utf-8"
+    )
