@@ -18,8 +18,8 @@ import httpx
 import numpy as np
 from numpy.typing import NDArray
 
-from fvb.config import EngineConfig
-from fvb.engines.base import Engine, PhaseStats, Row, directory_size
+from fvb.config import EngineConfig, TextConfig
+from fvb.engines.base import Engine, PhaseStats, Row, directory_size, row_parts
 
 
 _ARCHIVE_SHA256 = {
@@ -35,12 +35,16 @@ def _insert_bodies(rows: Sequence[Row], max_rows: int) -> Iterable[tuple[bytes, 
     suffix = b"] RETURN NONE;"
     encoded_rows: list[bytes] = []
     encoded_bytes = 0
-    for row_id, tenant, vector in rows:
-        encoded = json.dumps({
+    for row in rows:
+        row_id, tenant, vector, content = row_parts(row)
+        document: dict[str, object] = {
             "source_id": row_id,
             "tenant": tenant,
             "embedding": np.asarray(vector, dtype=np.float32).tolist(),
-        }, separators=(",", ":")).encode()
+        }
+        if content is not None:
+            document["content"] = content
+        encoded = json.dumps(document, separators=(",", ":")).encode()
         separator_bytes = len(encoded_rows)
         candidate_bytes = len(prefix) + encoded_bytes + separator_bytes + len(encoded) + len(suffix)
         if encoded_rows and (len(encoded_rows) >= max_rows or
@@ -68,9 +72,11 @@ class SurrealDBEngine(Engine):
     name = "surrealdb"
 
     def __init__(self, workdir: Path, dimensions: int, timeout: int, memory_cap_bytes: int,
-                 settings: EngineConfig, cache_dir: Path) -> None:
+                 settings: EngineConfig, cache_dir: Path, text: TextConfig) -> None:
         super().__init__(workdir, dimensions, timeout, memory_cap_bytes)
         self.settings = settings
+        self.text = text
+        self.text_score_zero_detected = False
         self.cache_dir = cache_dir
         self.port = _free_port()
         self.container = f"fvb-surreal-{self.port}"
@@ -227,9 +233,12 @@ class SurrealDBEngine(Engine):
             DEFINE FIELD source_id ON item TYPE int;
             DEFINE FIELD tenant ON item TYPE string;
             DEFINE FIELD embedding ON item TYPE array<float, {self.dimensions}>;
+            {"DEFINE FIELD content ON item TYPE string;" if self.text.enabled else ""}
             DEFINE INDEX item_tenant_idx ON item FIELDS tenant;
             DEFINE INDEX item_embedding_hnsw_idx ON item FIELDS embedding
                 HNSW DIMENSION {self.dimensions} TYPE F32 DIST COSINE;
+            {"DEFINE ANALYZER fvb_ascii TOKENIZERS class FILTERS lowercase,ascii;" if self.text.enabled else ""}
+            {"DEFINE INDEX item_content_fulltext_idx ON item FIELDS content FULLTEXT ANALYZER fvb_ascii BM25;" if self.text.enabled else ""}
         """
         self._rpc(schema)
         started = time.perf_counter()
@@ -256,6 +265,7 @@ class SurrealDBEngine(Engine):
         elapsed = time.perf_counter() - started
         return PhaseStats(elapsed, count, self.disk_bytes(), {
             "index_maintained_during_load": True,
+            "text_index_maintained_during_load": self.text.enabled,
             "endpoint": "/sql",
             "load_workers": LOAD_WORKERS,
             "max_request_rows": max_body_rows,
@@ -301,6 +311,89 @@ class SurrealDBEngine(Engine):
         lowered = plan.lower()
         return "item_embedding_hnsw_idx" in lowered and "index" in lowered
 
+    def _text_select(self, tenant: str | None, k: int) -> str:
+        tenant_clause = " AND tenant = $tenant" if tenant is not None else ""
+        return (
+            "SELECT source_id, search::score(0) AS score FROM item "
+            f"WHERE content @0@ $text{tenant_clause} "
+            f"ORDER BY score DESC LIMIT {int(k)};"
+        )
+
+    def text_query(self, query: str, tenant: str | None, k: int) -> tuple[list[int], float]:
+        """Execute a BM25-ranked full-text predicate with the tenant filter in SurrealQL."""
+        started = time.perf_counter()
+        statements = self._rpc(self._text_select(tenant, k), {"text": query, "tenant": tenant})
+        elapsed = time.perf_counter() - started
+        result = cast(list[dict[str, object]], statements[0].get("result", []))
+        if result and all(float(cast(float, row.get("score", 0.0))) == 0.0 for row in result):
+            self.text_score_zero_detected = True
+        return [int(cast(int, row["source_id"])) for row in result], elapsed
+
+    def text_explain(self, query: str, tenant: str | None, k: int) -> str:
+        """Capture JSON plan output for the exact full-text query."""
+        statements = self._rpc(
+            "EXPLAIN " + self._text_select(tenant, k), {"text": query, "tenant": tenant}
+        )
+        return json.dumps(statements[0].get("result"), sort_keys=True)
+
+    def plan_uses_text_index(self, plan: str) -> bool:
+        """Require the named FULLTEXT index in the plan."""
+        lowered = plan.lower()
+        return "item_content_fulltext_idx" in lowered and "index" in lowered
+
+    def _hybrid_statement(self, tenant: str | None, k: int, ef: int, candidates: int,
+                          rrf_k: int) -> str:
+        tenant_clause = " AND tenant = $tenant" if tenant is not None else ""
+        return f"""
+            LET $text_candidates = SELECT id, source_id, search::score(0) AS text_score
+                FROM item WHERE content @0@ $text{tenant_clause}
+                ORDER BY text_score DESC LIMIT {int(candidates)};
+            LET $vector_candidates = SELECT id, source_id,
+                    vector::distance::knn() AS distance
+                FROM item WHERE embedding <|{int(candidates)},{int(ef)}|> $vec{tenant_clause}
+                ORDER BY distance ASC LIMIT {int(candidates)};
+            RETURN search::rrf([$text_candidates, $vector_candidates], {int(k)}, {int(rrf_k)});
+        """
+
+    def hybrid_query(self, vector: NDArray[np.float32], query: str, tenant: str | None,
+                     k: int, ef: int, candidates: int, rrf_k: int) -> tuple[list[int], float]:
+        """Fuse BM25 and HNSW candidates with search::rrf in one RPC query request."""
+        variables = {
+            "vec": np.asarray(vector, dtype=np.float32).tolist(),
+            "text": query,
+            "tenant": tenant,
+        }
+        started = time.perf_counter()
+        statements = self._rpc(
+            self._hybrid_statement(tenant, k, ef, candidates, rrf_k), variables
+        )
+        elapsed = time.perf_counter() - started
+        result = cast(list[dict[str, object]], statements[-1].get("result", []))
+        if result and all(float(cast(float, row.get("text_score", 0.0))) == 0.0
+                          for row in result if "text_score" in row):
+            text_rows = [row for row in result if "text_score" in row]
+            self.text_score_zero_detected = self.text_score_zero_detected or bool(text_rows)
+        return [int(cast(int, row["source_id"])) for row in result], elapsed
+
+    def hybrid_explain(self, vector: NDArray[np.float32], query: str, tenant: str | None,
+                       k: int, ef: int, candidates: int, rrf_k: int) -> str:
+        """Capture both exact retrieval-branch plans in one SurrealDB request."""
+        tenant_clause = " AND tenant = $tenant" if tenant is not None else ""
+        sql = f"""
+            EXPLAIN SELECT source_id, search::score(0) AS text_score FROM item
+                WHERE content @0@ $text{tenant_clause}
+                ORDER BY text_score DESC LIMIT {int(candidates)};
+            EXPLAIN SELECT source_id, vector::distance::knn() AS distance FROM item
+                WHERE embedding <|{int(candidates)},{int(ef)}|> $vec{tenant_clause}
+                ORDER BY distance ASC LIMIT {int(candidates)};
+        """
+        statements = self._rpc(sql, {
+            "vec": np.asarray(vector, dtype=np.float32).tolist(),
+            "text": query,
+            "tenant": tenant,
+        })
+        return json.dumps([statement.get("result") for statement in statements], sort_keys=True)
+
     def version(self) -> dict[str, str]:
         """Read the server version through its unauthenticated version endpoint."""
         response = self._client.get(f"http://127.0.0.1:{self.port}/version")
@@ -330,9 +423,12 @@ class SurrealDBEngine(Engine):
         if operation == "delete":
             self._rpc("DELETE type::record('item', $id);", {"id": source_id})
         else:
-            self._rpc("UPSERT type::record('item', $id) CONTENT {source_id: $id, tenant: $tenant, embedding: $vec};",
-                      {"id": source_id, "tenant": tenant,
-                       "vec": np.asarray(vector, dtype=np.float32).tolist()})
+            self._rpc(
+                "UPSERT type::record('item', $id) MERGE {source_id: $id, tenant: $tenant, "
+                "embedding: $vec};",
+                {"id": source_id, "tenant": tenant,
+                 "vec": np.asarray(vector, dtype=np.float32).tolist()},
+            )
 
     def cleanup(self) -> None:
         """Remove the disposable container definition."""

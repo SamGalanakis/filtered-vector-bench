@@ -6,10 +6,31 @@ systems are internally identical. The following rules are part of the benchmark 
 ## Identical workload
 
 For a given dimension and scale, both engines consume byte-identical float32 vectors, source IDs,
-tenant assignments, and query vectors generated from one fixed seed. Exact cosine top-K is
+tenant assignments, documents, query vectors, and text queries generated from one fixed seed.
+Exact cosine top-K is
 computed once with NumPy over each eligible tenant subset and shared by both engines. Query order
 is deterministic and every configured engine sees the same matrix. Runs occur serially on the
 same host to avoid cross-engine resource contention.
+
+Each embedding cluster has a seeded, rank-ordered topic vocabulary (60 terms by default), disjoint
+from the other clusters, plus a shared 2,000-term background vocabulary. Documents contain 80–200
+tokens; the topic/background draw is binomial with expected topic share 35%, and both vocabulary
+draws are Zipf-weighted. A document's RNG is derived from its source ID, so generation is invariant
+to chunking. Each 3–6-term text query uses the topic vocabulary belonging to its query vector's
+cluster. The same query mapping is reused across all selectivity tiers.
+
+Full-text and hybrid quality use constructed same-cluster relevance within the eligible tenant
+subset: a same-cluster row has grade 1 and every other row grade 0. The report computes nDCG@10;
+when a tiny eligible subset contains no row from the query cluster, its ideal DCG is zero and the
+query receives nDCG 0. Exact top-K recall is deliberately not reported for text because engine
+lexical scores are not a shared exact-distance ordering. nDCG against the constructed relevance is
+the shared standard for both FTS and hybrid.
+
+Documents are stored in a fixed-width byte-string `.npy` memory map and decoded one load batch at a
+time, just like vector chunks. With the default vocabulary widths the 200-token bound reserves
+1,199 bytes per row: about 1.12 GiB at 1M rows and 11.17 GiB at 10M (plus a 128-byte NumPy header).
+The fixed width trades some disk overhead for deterministic O(1) random access without an in-RAM
+million-string object array.
 
 ## Durability
 
@@ -28,9 +49,18 @@ pooled results.
 ## Load and build
 
 SurrealDB's index is defined before inserts and maintained during load. PostgreSQL loads the table
-and then builds HNSW. The harness reports insert throughput, index-build time, and total
+and then builds HNSW. When text is enabled, SurrealDB also defines its FULLTEXT index before
+inserts, so its text-index cost is inseparable from load; PostgreSQL generates an English
+`tsvector` during COPY and separately times its post-load GIN build. PostgreSQL records vector and
+text index seconds independently in `index_details`. The harness reports insert throughput,
+index-build time, and total
 time-to-queryable separately. The cross-engine comparison uses total time-to-queryable; raw load
 rate alone is not presented as equivalent work.
+
+The ordinary ladder loads vector and text indexes together. A separate 100k smoke validation must
+compare vector-only with vector+text load for each engine so SurrealDB's maintain-during-load cost
+remains visible; those delta measurements belong in the validation report rather than being
+misrepresented as a separately exposed SurrealDB build timer.
 
 `batch_size` is the maximum row count handed to both adapters. SurrealDB sends compact plain-text
 `/sql` inserts with four in-flight workers and splits a configured batch further when its encoded
@@ -72,10 +102,14 @@ physical cold-disk test.
 
 ## Plan verification
 
-Before every selectivity suite, each adapter captures `EXPLAIN` for its exact query form and checks
-for its vector index. A failed gate is retained beside the timings and highlighted in the summary;
-the suite still runs because fallback planning is itself a result. The gate is deliberately
-conservative and raw plans are stored for audit.
+Before every selectivity suite, each adapter captures `EXPLAIN` for its exact query form. Vector
+suites gate the vector index, FTS suites gate the GIN/FULLTEXT index, and hybrid suites record
+vector, text, and combined gates. A failed gate is retained beside the timings and highlighted in
+the summary; the suite still runs because fallback planning is itself a result. PostgreSQL emits
+one JSON plan containing both materialized CTEs. SurrealDB 3.2.1 cannot prefix the multi-statement
+`LET` fusion form with one `EXPLAIN`, so one RPC request captures EXPLAIN output for the two exact
+candidate subqueries used by that statement; the combined gate requires both named indexes. Raw
+plans are stored for audit.
 
 ## Query forms
 
@@ -87,6 +121,30 @@ Each adapter uses its engine's documented idiomatic ANN form rather than forcing
 
 These may use pre- or post-filtering differently. Exact eligible-subset recall and underfill are
 reported precisely so that behavior remains observable.
+
+The full-text and hybrid forms are likewise native rather than textually symmetric:
+
+- SurrealDB FTS: `content @0@ $text [AND tenant = $tenant]`, ordered by
+  `search::score(0)`. The schema uses `TOKENIZERS class FILTERS lowercase,ascii` and a
+  `FULLTEXT ... BM25` index. Hybrid is one RPC query request: two tenant-filtered `LET` subqueries
+  retrieve text and HNSW top-40 candidates, followed by
+  `search::rrf([$text_candidates, $vector_candidates], 10, 60)`. In SurrealDB 3.2.1 the function
+  signature is `(lists, limit, k)`.
+- PostgreSQL FTS: a stored generated `to_tsvector('english', content)` column with GIN, queried via
+  `plainto_tsquery('english', ...)` and ordered by `ts_rank_cd`. Hybrid is one SQL statement with
+  tenant-filtered vector and text top-40 materialized CTEs, rank-number RRF with `k=60`, and
+  `LIMIT 10`.
+
+PostgreSQL's stock ranking is lexical `ts_rank_cd`; it is not corpus-IDF BM25. True-BM25 extensions
+exist, but they are not available on mainstream managed PostgreSQL services and are outside this
+stock-engine comparison. SurrealDB's native FULLTEXT index does use BM25. This ranking asymmetry is
+inherent and must be stated alongside results, not tuned away.
+
+SurrealDB issue #7290 reports `search::score(0) = 0` for all matches on some fresh databases. The
+harness detects and records an all-zero nonempty result set in every FTS/hybrid suite. The issue
+thread notes that the failure was associated with very small corpora, so smoke and ladder corpora
+remain above that range; no silent client-side reranking is allowed. If observed, results and the
+flag remain as engine behavior rather than being presented as functioning BM25.
 
 ## Relationship to the reference control
 

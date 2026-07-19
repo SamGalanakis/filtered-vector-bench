@@ -5,10 +5,12 @@ filter—by tenant, user, permission scope, or category—and *filtered* ANN is 
 differ most: pre- vs post-filtering, predicate pushdown, selectivity behavior, and memory under
 load.
 
-This project runs an identical, configurable filtered-vector workload against multiple engines
+This project runs an identical, configurable filtered-vector, full-text, and hybrid RRF workload
+against multiple engines
 on the same machine, with the same data, queries, and exact ground truth. It reports recall,
 latency, underfill, memory, cold-start, and load behavior as curves across a scale ladder.
-Currently supported engines are SurrealDB (HNSW) and PostgreSQL + pgvector (HNSW). The harness
+Currently supported engines are SurrealDB (HNSW + BM25) and PostgreSQL + pgvector
+(HNSW + `tsvector`/GIN). The harness
 is engine-extensible by design: one adapter file per engine.
 
 ## Quickstart
@@ -39,9 +41,11 @@ container and volume.
 ## What a run does
 
 Each `(engine, dimensions, document count)` cell generates or reuses deterministic memory-mapped
-data and exact eligible-subset ground truth. It then loads, settles, performs two cold restarts,
-runs every configured selectivity/EF/query-mode suite, optionally applies churn, and collects
-disk, plan, latency, recall, underfill, and process-tree memory data. A missing vector-index node
+data and exact eligible-subset ground truth. When text is enabled, every embedding cluster also
+gets deterministic topic documents and aligned text queries. The runner loads, settles, performs
+two cold restarts, runs every configured vector suite, then FTS and single-statement hybrid suites,
+optionally applies churn, and collects disk, plan, latency, recall/nDCG, underfill, and process-tree
+memory data. A missing expected index node
 in `EXPLAIN` is recorded prominently but does not suppress the measurement. A process killed at
 the configured memory cap becomes an `exceeded_memory_cap` result and does not abort later cells.
 Generated NumPy data lives in ignored `data/`; disposable engine stores and downloaded binaries
@@ -56,6 +60,8 @@ idiomatic query can imply different filtered-ANN semantics; recall and underfill
 `scripts/report.py` writes PNG and SVG charts plus `summary.md` beneath the result directory:
 
 - recall@10, p50/p95 latency, and underfill versus selectivity
+- FTS and hybrid p50/p95 latency versus selectivity
+- FTS/hybrid nDCG@10 versus selectivity in paired panels
 - peak query memory, restart-to-first-query, load rate, and time-to-queryable versus scale
 - when enabled, churn memory and pre/post recall delta
 
@@ -73,6 +79,11 @@ PostgreSQL modes map to pgvector's `hnsw.iterative_scan`: `default` disables it,
 `strict_order` preserves exact ordering, and `relaxed_order` permits relaxed ordering. SurrealDB
 has one documented query mode. Engine HNSW construction parameters remain at each engine's
 defaults and are captured in metadata.
+
+The optional `text` mapping controls `enabled`, hybrid candidate depth (`fts_candidates`), and the
+RRF smoothing constant (`rrf_k`). Topic and background vocabulary sizes default to 60 and 2,000;
+the smoke config deliberately uses smaller vocabularies. Omitting `text` preserves the original
+vector-only workload and schema.
 
 ## Add an engine
 

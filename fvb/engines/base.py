@@ -16,7 +16,16 @@ import numpy as np
 from numpy.typing import NDArray
 
 
-Row = tuple[int, str, NDArray[np.float32]]
+Row = (tuple[int, str, NDArray[np.float32]] |
+       tuple[int, str, NDArray[np.float32], str | None])
+
+
+def row_parts(row: Row) -> tuple[int, str, NDArray[np.float32], str | None]:
+    """Normalize legacy vector-only triples and current text-capable rows."""
+    if len(row) == 3:
+        source_id, tenant, vector = row
+        return source_id, tenant, vector, None
+    return row
 
 
 @dataclass(frozen=True)
@@ -75,6 +84,32 @@ class Engine(abc.ABC):
         """Return whether the captured plan uses the vector index."""
 
     @abc.abstractmethod
+    def text_query(self, query: str, tenant: str | None, k: int) -> tuple[list[int], float]:
+        """Execute one filtered full-text query."""
+
+    @abc.abstractmethod
+    def text_explain(self, query: str, tenant: str | None, k: int) -> str:
+        """Return the plan for the exact full-text query."""
+
+    @abc.abstractmethod
+    def plan_uses_text_index(self, plan: str) -> bool:
+        """Return whether a full-text plan uses the expected text index."""
+
+    @abc.abstractmethod
+    def hybrid_query(self, vector: NDArray[np.float32], query: str, tenant: str | None,
+                     k: int, ef: int, candidates: int, rrf_k: int) -> tuple[list[int], float]:
+        """Execute one single-statement vector + text + RRF query."""
+
+    @abc.abstractmethod
+    def hybrid_explain(self, vector: NDArray[np.float32], query: str, tenant: str | None,
+                       k: int, ef: int, candidates: int, rrf_k: int) -> str:
+        """Return plan evidence for the hybrid query's candidate branches."""
+
+    def hybrid_plan_uses_indexes(self, plan: str) -> tuple[bool, bool]:
+        """Return vector-index and text-index gates for a hybrid plan."""
+        return self.plan_uses_index(plan), self.plan_uses_text_index(plan)
+
+    @abc.abstractmethod
     def version(self) -> dict[str, str]:
         """Return server and extension versions."""
 
@@ -123,4 +158,3 @@ def directory_size(path: Path) -> int:
             except FileNotFoundError:
                 continue
     return total
-

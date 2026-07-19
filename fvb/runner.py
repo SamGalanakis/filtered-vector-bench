@@ -19,7 +19,7 @@ from fvb.data import DataArtifacts, generate_data, iter_rows, tenant_name
 from fvb.engines.base import Engine, Row
 from fvb.engines.postgres import PostgresEngine
 from fvb.engines.surrealdb import SurrealDBEngine
-from fvb.ground_truth import compute_ground_truth, load_truth, recall_at_k
+from fvb.ground_truth import compute_ground_truth, load_truth, ndcg_at_k, recall_at_k
 from fvb.memsample import MemorySampler
 
 
@@ -135,9 +135,10 @@ class BenchmarkRunner:
         if context.engine_name == "surrealdb":
             return SurrealDBEngine(workdir, context.dimensions,
                                    self.config.client_timeout_seconds, self.config.memory_cap_bytes,
-                                   settings, self.cache_root)
+                                   settings, self.cache_root, self.config.text)
         return PostgresEngine(workdir, context.dimensions,
-                              self.config.client_timeout_seconds, self.config.memory_cap_bytes, settings)
+                              self.config.client_timeout_seconds, self.config.memory_cap_bytes,
+                              settings, self.config.text)
 
     def _oom_detected(self, engine: Engine) -> bool:
         container = getattr(engine, "container", None)
@@ -225,6 +226,9 @@ class BenchmarkRunner:
                                   result_count=len(ids), source_ids=ids)
 
             self._suite(context, engine, artifacts, truth_path, "pre_churn", sampler)
+            if self.config.text.enabled:
+                self._text_suite(context, engine, artifacts, sampler)
+                self._hybrid_suite(context, engine, artifacts, sampler)
             if self.config.churn.enabled:
                 changes = self._churn(context, engine, artifacts, sampler)
                 post_truth = self._post_churn_truth(artifacts, truth_path, changes)
@@ -301,6 +305,164 @@ class BenchmarkRunner:
                                       underfill_percent=100 * underfills / len(latencies),
                                       mean_result_count=float(np.mean(result_counts)),
                                       plan=plan, plan_uses_index=uses_index)
+
+    def _text_relevance(self, clusters: np.ndarray, eligible: np.ndarray,
+                        relevant_count: int, query_cluster: int,
+                        ids: list[int]) -> tuple[list[float], list[float]]:
+        """Return observed and ideal same-cluster relevance for one filtered result list."""
+        observed = [
+            1.0 if 0 <= source_id < len(clusters) and eligible[source_id]
+            and int(clusters[source_id]) == query_cluster else 0.0
+            for source_id in ids
+        ]
+        return observed, [1.0] * min(self.config.k, relevant_count)
+
+    def _text_suite(self, context: CellContext, engine: Engine, artifacts: DataArtifacts,
+                    sampler: MemorySampler) -> None:
+        """Run text-only filtered queries once per selectivity tier."""
+        assert artifacts.query_texts is not None
+        assert artifacts.document_clusters is not None
+        query_texts = np.load(artifacts.query_texts, mmap_mode="r")
+        query_clusters = np.load(artifacts.query_clusters, mmap_mode="r")
+        document_clusters = np.load(artifacts.document_clusters, mmap_mode="r")
+        tenants = np.load(artifacts.tenants, mmap_mode="r")
+        for selectivity in self.config.selectivities:
+            tenant = tenant_name(selectivity)
+            eligible = (np.ones(len(document_clusters), dtype=np.bool_) if tenant is None else
+                        np.asarray(tenants == tenant, dtype=np.bool_))
+            relevant_counts = np.bincount(
+                np.asarray(document_clusters[eligible], dtype=np.int64),
+                minlength=self.config.clusters,
+            )
+            suite_id = f"{context.cell_id}:fts_suite:s{selectivity}"
+            first_query = bytes(query_texts[0]).decode("ascii")
+            context.phase = f"fts_suite:s{selectivity}:explain"
+            plan = engine.text_explain(first_query, tenant, self.config.k)
+            uses_index = engine.plan_uses_text_index(plan)
+            self.plans.write(
+                "fts_plan", cell_id=context.cell_id, suite_id=suite_id,
+                selectivity=selectivity, uses_text_index=uses_index, plan=plan,
+            )
+            latencies: list[float] = []
+            ndcgs: list[float] = []
+            result_counts: list[int] = []
+            underfills = 0
+            context.phase = f"fts_suite:s{selectivity}:queries"
+            sampler.sample_now()
+            for query_index, encoded_query in enumerate(query_texts):
+                text_query = bytes(encoded_query).decode("ascii")
+                ids, wall = engine.text_query(text_query, tenant, self.config.k)
+                query_cluster = int(query_clusters[query_index])
+                observed, ideal = self._text_relevance(
+                    document_clusters, eligible, int(relevant_counts[query_cluster]),
+                    query_cluster, ids,
+                )
+                ndcg = ndcg_at_k(observed, ideal, self.config.k)
+                underfill = len(ids) < self.config.k
+                latencies.append(wall)
+                ndcgs.append(ndcg)
+                result_counts.append(len(ids))
+                underfills += int(underfill)
+                self.queries.write(
+                    "fts_query", cell_id=context.cell_id, suite_id=suite_id,
+                    selectivity=selectivity, query_index=query_index,
+                    text_query=text_query, latency_seconds=wall, ndcg_at_10=ndcg,
+                    result_count=len(ids), underfill=underfill, source_ids=ids,
+                )
+            sampler.sample_now()
+            self.events.write(
+                "fts_suite_complete", cell_id=context.cell_id, suite_id=suite_id,
+                tier=tenant or "unfiltered", selectivity=selectivity,
+                n_queries=len(latencies), p50_ms=1000 * float(np.percentile(latencies, 50)),
+                p95_ms=1000 * float(np.percentile(latencies, 95)),
+                mean_ndcg_at_10=float(np.mean(ndcgs)), underfill=underfills,
+                underfill_percent=100 * underfills / len(latencies),
+                mean_result_count=float(np.mean(result_counts)), plan=plan,
+                plan_uses_text_index=uses_index,
+                surrealdb_score_zero_issue=bool(
+                    getattr(engine, "text_score_zero_detected", False)
+                ),
+            )
+
+    def _hybrid_suite(self, context: CellContext, engine: Engine, artifacts: DataArtifacts,
+                      sampler: MemorySampler) -> None:
+        """Run one-statement vector + text RRF queries per selectivity and EF value."""
+        assert artifacts.query_texts is not None
+        assert artifacts.document_clusters is not None
+        vectors = np.load(artifacts.queries, mmap_mode="r")
+        query_texts = np.load(artifacts.query_texts, mmap_mode="r")
+        query_clusters = np.load(artifacts.query_clusters, mmap_mode="r")
+        document_clusters = np.load(artifacts.document_clusters, mmap_mode="r")
+        tenants = np.load(artifacts.tenants, mmap_mode="r")
+        for selectivity in self.config.selectivities:
+            tenant = tenant_name(selectivity)
+            eligible = (np.ones(len(document_clusters), dtype=np.bool_) if tenant is None else
+                        np.asarray(tenants == tenant, dtype=np.bool_))
+            relevant_counts = np.bincount(
+                np.asarray(document_clusters[eligible], dtype=np.int64),
+                minlength=self.config.clusters,
+            )
+            for ef in self.config.ef_values:
+                suite_id = f"{context.cell_id}:hybrid_suite:s{selectivity}:ef{ef}"
+                first_query = bytes(query_texts[0]).decode("ascii")
+                context.phase = f"hybrid_suite:s{selectivity}:ef{ef}:explain"
+                plan = engine.hybrid_explain(
+                    vectors[0], first_query, tenant, self.config.k, ef,
+                    self.config.text.fts_candidates, self.config.text.rrf_k,
+                )
+                uses_vector, uses_text = engine.hybrid_plan_uses_indexes(plan)
+                self.plans.write(
+                    "hybrid_plan", cell_id=context.cell_id, suite_id=suite_id,
+                    selectivity=selectivity, ef=ef, uses_vector_index=uses_vector,
+                    uses_text_index=uses_text, uses_both_indexes=uses_vector and uses_text,
+                    plan=plan,
+                )
+                latencies: list[float] = []
+                ndcgs: list[float] = []
+                result_counts: list[int] = []
+                underfills = 0
+                context.phase = f"hybrid_suite:s{selectivity}:ef{ef}:queries"
+                sampler.sample_now()
+                for query_index, vector in enumerate(vectors):
+                    text_query = bytes(query_texts[query_index]).decode("ascii")
+                    ids, wall = engine.hybrid_query(
+                        vector, text_query, tenant, self.config.k, ef,
+                        self.config.text.fts_candidates, self.config.text.rrf_k,
+                    )
+                    query_cluster = int(query_clusters[query_index])
+                    observed, ideal = self._text_relevance(
+                        document_clusters, eligible, int(relevant_counts[query_cluster]),
+                        query_cluster, ids,
+                    )
+                    ndcg = ndcg_at_k(observed, ideal, self.config.k)
+                    underfill = len(ids) < self.config.k
+                    latencies.append(wall)
+                    ndcgs.append(ndcg)
+                    result_counts.append(len(ids))
+                    underfills += int(underfill)
+                    self.queries.write(
+                        "hybrid_query", cell_id=context.cell_id, suite_id=suite_id,
+                        selectivity=selectivity, ef=ef, query_index=query_index,
+                        text_query=text_query, latency_seconds=wall, ndcg_at_10=ndcg,
+                        result_count=len(ids), underfill=underfill, source_ids=ids,
+                    )
+                sampler.sample_now()
+                self.events.write(
+                    "hybrid_suite_complete", cell_id=context.cell_id, suite_id=suite_id,
+                    tier=tenant or "unfiltered", selectivity=selectivity, ef=ef,
+                    candidates=self.config.text.fts_candidates, rrf_k=self.config.text.rrf_k,
+                    n_queries=len(latencies),
+                    p50_ms=1000 * float(np.percentile(latencies, 50)),
+                    p95_ms=1000 * float(np.percentile(latencies, 95)),
+                    mean_ndcg_at_10=float(np.mean(ndcgs)), underfill=underfills,
+                    underfill_percent=100 * underfills / len(latencies),
+                    mean_result_count=float(np.mean(result_counts)), plan=plan,
+                    plan_uses_vector_index=uses_vector, plan_uses_text_index=uses_text,
+                    plan_uses_both_indexes=uses_vector and uses_text,
+                    surrealdb_score_zero_issue=bool(
+                        getattr(engine, "text_score_zero_detected", False)
+                    ),
+                )
 
     def _churn(self, context: CellContext, engine: Engine,
                artifacts: DataArtifacts,

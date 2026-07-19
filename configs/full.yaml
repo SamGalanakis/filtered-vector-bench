@@ -14,6 +14,12 @@ memory_cap_gib: 64
 data_chunk_rows: 10000
 ground_truth_batch_rows: 50000
 postgres_modes: [default, strict_order, relaxed_order]
+text:
+  enabled: true
+  fts_candidates: 40
+  rrf_k: 60
+  topic_vocabulary_size: 60
+  background_vocabulary_size: 2000
 churn:
   enabled: true
   seconds: 300

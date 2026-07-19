@@ -132,6 +132,24 @@ def _plot_series(axis: Axes, rows: list[dict[str, Any]], value: str) -> None:
                           color=COLORS[engine], fontsize=8, va="center")
 
 
+def _plot_engine_series(axis: Axes, rows: list[dict[str, Any]], value: str) -> None:
+    """Plot one no-EF series per engine for the FTS suite."""
+    for series_index, engine in enumerate(sorted({_engine(row["cell_id"]) for row in rows})):
+        points = sorted(
+            (row for row in rows if _engine(row["cell_id"]) == engine),
+            key=lambda item: float(item["selectivity"]), reverse=True,
+        )
+        x = [100 * float(item["selectivity"]) for item in points]
+        y = [float(item[value]) for item in points]
+        axis.plot(x, y, color=COLORS[engine], linewidth=2, marker="o", markersize=8,
+                  label=DISPLAY[engine])
+        if x and math.isfinite(y[-1]):
+            offset = (series_index - 0.5) * 11
+            axis.annotate(DISPLAY[engine], (x[-1], y[-1]), xytext=(5, offset),
+                          textcoords="offset points", color=COLORS[engine], fontsize=8,
+                          va="center")
+
+
 def _series_legend(axis: Axes, rows: list[dict[str, Any]]) -> None:
     """Use one compact visual-key legend instead of one entry per PG series."""
     engines = sorted({_engine(row["cell_id"]) for row in rows})
@@ -230,6 +248,82 @@ def _selectivity_figures(suites: list[dict[str, Any]], outcomes: dict[str, dict[
             _series_legend(axis, rows)
             _annotate_missing(axis, rows, outcomes, dimension, n_docs)
         _save(figure, charts, f"underfill-vs-selectivity-d{dimension}")
+
+
+def _text_figures(fts: list[dict[str, Any]], hybrid: list[dict[str, Any]],
+                  outcomes: dict[str, dict[str, Any]], charts: Path) -> None:
+    """Render the FTS/hybrid latency families and shared-standard nDCG panels."""
+    all_cells = {row["cell_id"] for row in [*fts, *hybrid]} | set(outcomes)
+    dimensions = sorted({_cell_parts(cell)[1] for cell in all_cells})
+    for dimension in dimensions:
+        scales = sorted({_cell_parts(cell)[2] for cell in all_cells
+                         if _cell_parts(cell)[1] == dimension})
+        if fts:
+            figure, axes = plt.subplots(
+                2, len(scales), figsize=(6.5 * len(scales), 8.5), squeeze=False
+            )
+            for column, n_docs in enumerate(scales):
+                rows = [row for row in fts
+                        if _cell_parts(row["cell_id"])[1:] == (dimension, n_docs)]
+                for axis, field, percentile in (
+                    (axes[0, column], "p50_ms", "p50"),
+                    (axes[1, column], "p95_ms", "p95"),
+                ):
+                    _plot_engine_series(axis, rows, field)
+                    _apply_style(axis, f"{percentile} · {n_docs:,} documents",
+                                 "filter selectivity (% eligible)", "Latency (ms)")
+                    axis.set_xscale("log")
+                    axis.invert_xaxis()
+                    axis.set_yscale("log")
+                    _legend_if_present(axis)
+                    _annotate_missing(axis, rows, outcomes, dimension, n_docs)
+            _save(figure, charts, f"fts-latency-vs-selectivity-d{dimension}")
+
+        if hybrid:
+            figure, axes = plt.subplots(
+                2, len(scales), figsize=(6.5 * len(scales), 8.5), squeeze=False
+            )
+            for column, n_docs in enumerate(scales):
+                rows = [row for row in hybrid
+                        if _cell_parts(row["cell_id"])[1:] == (dimension, n_docs)]
+                for axis, field, percentile in (
+                    (axes[0, column], "p50_ms", "p50"),
+                    (axes[1, column], "p95_ms", "p95"),
+                ):
+                    _plot_series(axis, rows, field)
+                    _apply_style(axis, f"{percentile} · {n_docs:,} documents",
+                                 "filter selectivity (% eligible)", "Latency (ms)")
+                    axis.set_xscale("log")
+                    axis.invert_xaxis()
+                    axis.set_yscale("log")
+                    _series_legend(axis, rows)
+                    _annotate_missing(axis, rows, outcomes, dimension, n_docs)
+            _save(figure, charts, f"hybrid-latency-vs-selectivity-d{dimension}")
+
+        if fts or hybrid:
+            figure, axes = plt.subplots(
+                2, len(scales), figsize=(6.5 * len(scales), 8.5), squeeze=False
+            )
+            for column, n_docs in enumerate(scales):
+                fts_rows = [row for row in fts
+                            if _cell_parts(row["cell_id"])[1:] == (dimension, n_docs)]
+                hybrid_rows = [row for row in hybrid
+                               if _cell_parts(row["cell_id"])[1:] == (dimension, n_docs)]
+                _plot_engine_series(axes[0, column], fts_rows, "mean_ndcg_at_10")
+                _apply_style(axes[0, column], f"FTS · {n_docs:,} documents",
+                             "filter selectivity (% eligible)", "nDCG@10")
+                _plot_series(axes[1, column], hybrid_rows, "mean_ndcg_at_10")
+                _apply_style(axes[1, column], f"Hybrid · {n_docs:,} documents",
+                             "filter selectivity (% eligible)", "nDCG@10")
+                for axis, rows in ((axes[0, column], fts_rows),
+                                   (axes[1, column], hybrid_rows)):
+                    axis.set_xscale("log")
+                    axis.invert_xaxis()
+                    axis.set_ylim(-0.02, 1.02)
+                    _annotate_missing(axis, rows, outcomes, dimension, n_docs)
+                _legend_if_present(axes[0, column])
+                _series_legend(axes[1, column], hybrid_rows)
+            _save(figure, charts, f"ndcg-vs-selectivity-d{dimension}")
 
 
 def _memory_peaks(results: Path) -> dict[str, dict[str, float | str]]:
@@ -455,7 +549,8 @@ def _churn_charts(suites: list[dict[str, Any]], results: Path, charts: Path) -> 
     _save(figure, charts, "churn-recall-delta")
 
 
-def _markdown(events: list[dict[str, Any]], suites: list[dict[str, Any]], results: Path,
+def _markdown(events: list[dict[str, Any]], suites: list[dict[str, Any]],
+              fts: list[dict[str, Any]], hybrid: list[dict[str, Any]], results: Path,
               peaks: dict[str, dict[str, float | str]],
               outcomes: dict[str, dict[str, Any]]) -> str:
     metadata = json.loads((results / "metadata.json").read_text(encoding="utf-8"))
@@ -504,6 +599,40 @@ def _markdown(events: list[dict[str, Any]], suites: list[dict[str, Any]], result
                      f"{float(row['p50_ms']):.3f} | {float(row['p95_ms']):.3f} | "
                      f"{int(row['underfill'])}/{int(row.get('n_queries', 0))} "
                      f"({float(row['underfill_percent']):.2f}%) | {mean_results_text} |")
+    lines += ["", "## Full-text suites", "",
+              "| Engine | Dims | Documents | Tier | Selectivity | Text index plan | nDCG@10 | p50 ms | p95 ms | Underfill | Mean results | Score issue #7290 |",
+              "|---|---:|---:|---|---:|---|---:|---:|---:|---:|---:|---|"]
+    for row in sorted(fts, key=lambda item: (item["cell_id"], -float(item["selectivity"]))):
+        engine, dimensions, n_docs = _cell_parts(row["cell_id"])
+        gate = "yes" if row["plan_uses_text_index"] else "**NO**"
+        issue = "**observed**" if row.get("surrealdb_score_zero_issue") else "no"
+        lines.append(
+            f"| {DISPLAY[engine]} | {dimensions} | {n_docs:,} | {row['tier']} | "
+            f"{100 * float(row['selectivity']):g}% | {gate} | "
+            f"{float(row['mean_ndcg_at_10']):.4f} | {float(row['p50_ms']):.3f} | "
+            f"{float(row['p95_ms']):.3f} | {int(row['underfill'])}/"
+            f"{int(row['n_queries'])} ({float(row['underfill_percent']):.2f}%) | "
+            f"{float(row['mean_result_count']):.2f} | {issue} |"
+        )
+    lines += ["", "## Hybrid suites", "",
+              "| Engine | Dims | Documents | Tier | Selectivity | ef | Vector plan | Text plan | Both | nDCG@10 | p50 ms | p95 ms | Underfill | Mean results |",
+              "|---|---:|---:|---|---:|---:|---|---|---|---:|---:|---:|---:|---:|"]
+    for row in sorted(hybrid, key=lambda item: (
+        item["cell_id"], -float(item["selectivity"]), int(item["ef"])
+    )):
+        engine, dimensions, n_docs = _cell_parts(row["cell_id"])
+        gates = ["yes" if row[key] else "**NO**" for key in (
+            "plan_uses_vector_index", "plan_uses_text_index", "plan_uses_both_indexes"
+        )]
+        lines.append(
+            f"| {DISPLAY[engine]} | {dimensions} | {n_docs:,} | {row['tier']} | "
+            f"{100 * float(row['selectivity']):g}% | {row['ef']} | {gates[0]} | "
+            f"{gates[1]} | {gates[2]} | {float(row['mean_ndcg_at_10']):.4f} | "
+            f"{float(row['p50_ms']):.3f} | {float(row['p95_ms']):.3f} | "
+            f"{int(row['underfill'])}/{int(row['n_queries'])} "
+            f"({float(row['underfill_percent']):.2f}%) | "
+            f"{float(row['mean_result_count']):.2f} |"
+        )
     lines += ["", "## Metadata", "", "```json",
               json.dumps({"config_sha256": metadata["config_sha256"], "versions": versions,
                           "hardware_files": ["lscpu.txt", "meminfo.txt"]}, indent=2, sort_keys=True),
@@ -525,9 +654,14 @@ def generate_report(results: Path) -> None:
     outcomes = _effective_outcomes(events, peaks)
     suites = [_normalized_suite(row) for row in events if row["event"] == "suite_complete"
               and outcomes.get(row["cell_id"], {}).get("outcome", "ok") == "ok"]
+    fts = [row for row in events if row["event"] == "fts_suite_complete"
+           and outcomes.get(row["cell_id"], {}).get("outcome", "ok") == "ok"]
+    hybrid = [row for row in events if row["event"] == "hybrid_suite_complete"
+              and outcomes.get(row["cell_id"], {}).get("outcome", "ok") == "ok"]
     _selectivity_figures(suites, outcomes, charts)
+    _text_figures(fts, hybrid, outcomes, charts)
     _scale_charts(events, charts, outcomes, peaks)
     _churn_charts(suites, results, charts)
     (results / "summary.md").write_text(
-        _markdown(events, suites, results, peaks, outcomes), encoding="utf-8"
+        _markdown(events, suites, fts, hybrid, results, peaks, outcomes), encoding="utf-8"
     )

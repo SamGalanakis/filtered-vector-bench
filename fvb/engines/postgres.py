@@ -14,8 +14,8 @@ import numpy as np
 import psycopg
 from numpy.typing import NDArray
 
-from fvb.config import EngineConfig
-from fvb.engines.base import Engine, PhaseStats, Row, directory_size
+from fvb.config import EngineConfig, TextConfig
+from fvb.engines.base import Engine, PhaseStats, Row, directory_size, row_parts
 
 
 def _free_port() -> int:
@@ -34,9 +34,10 @@ class PostgresEngine(Engine):
     name = "postgres"
 
     def __init__(self, workdir: Path, dimensions: int, timeout: int, memory_cap_bytes: int,
-                 settings: EngineConfig) -> None:
+                 settings: EngineConfig, text: TextConfig) -> None:
         super().__init__(workdir, dimensions, timeout, memory_cap_bytes)
         self.settings = settings
+        self.text = text
         self.port = _free_port()
         self.container = f"fvb-postgres-{self.port}"
         self.process: subprocess.Popen[bytes] | None = None
@@ -120,15 +121,30 @@ class PostgresEngine(Engine):
         """Create schema and stream rows with text COPY."""
         with psycopg.connect(self.dsn, autocommit=True) as connection:
             connection.execute("CREATE EXTENSION IF NOT EXISTS vector")
-            connection.execute(f"CREATE TABLE item(source_id integer PRIMARY KEY, tenant text NOT NULL, embedding vector({self.dimensions}) NOT NULL)")
+            text_columns = (
+                ", content text NOT NULL, search_document tsvector GENERATED ALWAYS AS "
+                "(to_tsvector('english', content)) STORED"
+                if self.text.enabled else ""
+            )
+            connection.execute(
+                f"CREATE TABLE item(source_id integer PRIMARY KEY, tenant text NOT NULL, "
+                f"embedding vector({self.dimensions}) NOT NULL{text_columns})"
+            )
             connection.execute("CREATE INDEX item_tenant_idx ON item(tenant)")
         started = time.perf_counter()
         count = 0
         with psycopg.connect(self.dsn) as connection:
-            with connection.cursor().copy("COPY item(source_id, tenant, embedding) FROM STDIN") as copy:
+            columns = "source_id, tenant, embedding, content" if self.text.enabled else (
+                "source_id, tenant, embedding"
+            )
+            with connection.cursor().copy(f"COPY item({columns}) FROM STDIN") as copy:
                 for batch in rows:
-                    for source_id, tenant, vector in batch:
-                        copy.write_row((source_id, tenant, _vector(vector)))
+                    for row in batch:
+                        source_id, tenant, vector, content = row_parts(row)
+                        values = (source_id, tenant, _vector(vector), content) if self.text.enabled else (
+                            source_id, tenant, _vector(vector)
+                        )
+                        copy.write_row(values)
                     count += len(batch)
             connection.commit()
         elapsed = time.perf_counter() - started
@@ -142,10 +158,23 @@ class PostgresEngine(Engine):
                 CREATE INDEX item_embedding_hnsw_idx ON item
                 USING hnsw (embedding vector_cosine_ops) WITH (m=16, ef_construction=64)
             """)
+        vector_seconds = time.perf_counter() - started
+        text_seconds = 0.0
+        if self.text.enabled:
+            text_started = time.perf_counter()
+            with psycopg.connect(self.dsn, autocommit=True) as connection:
+                connection.execute(
+                    "CREATE INDEX item_search_document_gin_idx ON item USING gin (search_document)"
+                )
+            text_seconds = time.perf_counter() - text_started
+        with psycopg.connect(self.dsn, autocommit=True) as connection:
             connection.execute("ANALYZE item")
         elapsed = time.perf_counter() - started
         return PhaseStats(elapsed, disk_bytes=self.disk_bytes(), details={
-            "hnsw_parameters": {"m": 16, "ef_construction": 64, "source": "pgvector defaults"}
+            "hnsw_parameters": {"m": 16, "ef_construction": 64, "source": "pgvector defaults"},
+            "vector_index_seconds": vector_seconds,
+            "text_index_seconds": text_seconds if self.text.enabled else None,
+            "text_index": "GIN over generated english tsvector" if self.text.enabled else None,
         })
 
     @staticmethod
@@ -193,6 +222,112 @@ class PostgresEngine(Engine):
         lowered = plan.lower()
         return "item_embedding_hnsw_idx" in lowered and "index scan" in lowered
 
+    def _text_sql(self, tenant: str | None, k: int, explain: bool = False) -> str:
+        prefix = "EXPLAIN (FORMAT JSON) " if explain else ""
+        tenant_clause = "AND tenant = %s " if tenant is not None else ""
+        return (
+            f"{prefix}WITH query AS (SELECT plainto_tsquery('english', %s) AS value) "
+            "SELECT source_id FROM item, query "
+            f"WHERE search_document @@ query.value {tenant_clause}"
+            "ORDER BY ts_rank_cd(search_document, query.value) DESC, source_id LIMIT "
+            f"{int(k)}"
+        )
+
+    def text_query(self, query: str, tenant: str | None, k: int) -> tuple[list[int], float]:
+        """Run stock PostgreSQL lexical ranking over an english tsvector."""
+        args = (query, tenant) if tenant is not None else (query,)
+        started = time.perf_counter()
+        result = self._query_session().execute(self._text_sql(tenant, k), args).fetchall()
+        elapsed = time.perf_counter() - started
+        return [int(row[0]) for row in result], elapsed
+
+    def text_explain(self, query: str, tenant: str | None, k: int) -> str:
+        """Capture JSON EXPLAIN for the exact filtered text query."""
+        args = (query, tenant) if tenant is not None else (query,)
+        row = self._query_session().execute(self._text_sql(tenant, k, explain=True), args).fetchone()
+        if row is None:
+            raise RuntimeError("PostgreSQL text EXPLAIN returned no row")
+        return json.dumps(row[0], sort_keys=True)
+
+    def plan_uses_text_index(self, plan: str) -> bool:
+        """Require the named GIN index and its bitmap index scan."""
+        lowered = plan.lower()
+        return "item_search_document_gin_idx" in lowered and "bitmap index scan" in lowered
+
+    def _hybrid_sql(self, tenant: str | None, k: int, candidates: int, rrf_k: int,
+                    explain: bool = False) -> str:
+        prefix = "EXPLAIN (FORMAT JSON) " if explain else ""
+        vector_tenant = "WHERE tenant = %s " if tenant is not None else ""
+        text_tenant = "AND tenant = %s " if tenant is not None else ""
+        return f"""{prefix}
+            WITH vector_candidates AS MATERIALIZED (
+                SELECT source_id,
+                       row_number() OVER (ORDER BY embedding <=> %s::vector) AS rank
+                FROM item {vector_tenant}
+                ORDER BY embedding <=> %s::vector LIMIT {int(candidates)}
+            ), text_candidates AS MATERIALIZED (
+                SELECT source_id,
+                       row_number() OVER (
+                           ORDER BY ts_rank_cd(search_document,
+                               plainto_tsquery('english', %s)) DESC
+                       ) AS rank
+                FROM item
+                WHERE search_document @@ plainto_tsquery('english', %s) {text_tenant}
+                ORDER BY ts_rank_cd(search_document,
+                    plainto_tsquery('english', %s)) DESC
+                LIMIT {int(candidates)}
+            ), ranked AS (
+                SELECT source_id, rank FROM vector_candidates
+                UNION ALL
+                SELECT source_id, rank FROM text_candidates
+            )
+            SELECT source_id
+            FROM ranked
+            GROUP BY source_id
+            ORDER BY sum(1.0 / ({int(rrf_k)} + rank)) DESC, source_id
+            LIMIT {int(k)}
+        """
+
+    def _hybrid_args(self, vector: NDArray[np.float32], query: str,
+                     tenant: str | None) -> tuple[object, ...]:
+        args: list[object] = [_vector(vector)]
+        if tenant is not None:
+            args.append(tenant)
+        args.append(_vector(vector))
+        args.extend((query, query))
+        if tenant is not None:
+            args.append(tenant)
+        args.append(query)
+        return tuple(args)
+
+    def hybrid_query(self, vector: NDArray[np.float32], query: str, tenant: str | None,
+                     k: int, ef: int, candidates: int, rrf_k: int) -> tuple[list[int], float]:
+        """Fuse tenant-filtered top-N vector and lexical CTEs with RRF in one SQL statement."""
+        connection = self._query_session()
+        connection.execute(f"SET hnsw.ef_search = {int(ef)}")
+        connection.execute("SET hnsw.iterative_scan = off")
+        started = time.perf_counter()
+        result = connection.execute(
+            self._hybrid_sql(tenant, k, candidates, rrf_k),
+            self._hybrid_args(vector, query, tenant),
+        ).fetchall()
+        elapsed = time.perf_counter() - started
+        return [int(row[0]) for row in result], elapsed
+
+    def hybrid_explain(self, vector: NDArray[np.float32], query: str, tenant: str | None,
+                       k: int, ef: int, candidates: int, rrf_k: int) -> str:
+        """Capture one JSON plan containing both materialized retrieval CTEs."""
+        connection = self._query_session()
+        connection.execute(f"SET hnsw.ef_search = {int(ef)}")
+        connection.execute("SET hnsw.iterative_scan = off")
+        row = connection.execute(
+            self._hybrid_sql(tenant, k, candidates, rrf_k, explain=True),
+            self._hybrid_args(vector, query, tenant),
+        ).fetchone()
+        if row is None:
+            raise RuntimeError("PostgreSQL hybrid EXPLAIN returned no row")
+        return json.dumps(row[0], sort_keys=True)
+
     def version(self) -> dict[str, str]:
         """Return PostgreSQL server and pgvector extension versions."""
         with psycopg.connect(self.dsn) as connection:
@@ -230,6 +365,13 @@ class PostgresEngine(Engine):
         with psycopg.connect(self.dsn, autocommit=True) as connection:
             if operation == "delete":
                 connection.execute("DELETE FROM item WHERE source_id = %s", (source_id,))
+            elif self.text.enabled:
+                connection.execute("""
+                    INSERT INTO item(source_id, tenant, embedding, content)
+                    VALUES (%s, %s, %s::vector, '')
+                    ON CONFLICT (source_id) DO UPDATE
+                    SET tenant=excluded.tenant, embedding=excluded.embedding
+                """, (source_id, tenant, _vector(vector)))
             else:
                 connection.execute("""
                     INSERT INTO item(source_id, tenant, embedding) VALUES (%s, %s, %s::vector)

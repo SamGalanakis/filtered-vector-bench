@@ -21,6 +21,17 @@ class ChurnConfig:
 
 
 @dataclass(frozen=True)
+class TextConfig:
+    """Optional full-text and hybrid workload settings."""
+
+    enabled: bool
+    fts_candidates: int
+    rrf_k: int
+    topic_vocabulary_size: int = 60
+    background_vocabulary_size: int = 2000
+
+
+@dataclass(frozen=True)
 class EngineConfig:
     """Engine launch configuration."""
 
@@ -50,6 +61,7 @@ class BenchmarkConfig:
     data_chunk_rows: int
     ground_truth_batch_rows: int
     postgres_modes: tuple[str, ...]
+    text: TextConfig
     churn: ChurnConfig
     engines: dict[str, EngineConfig]
 
@@ -72,7 +84,7 @@ _TOP_KEYS = {
     "seed", "dimensions", "scales", "selectivities", "ef_values", "n_queries", "k",
     "clusters", "cluster_sigma", "batch_size", "settle_seconds", "client_timeout_seconds",
     "memory_cap_gib", "data_chunk_rows", "ground_truth_batch_rows", "postgres_modes", "churn",
-    "engines",
+    "engines", "text",
 }
 
 
@@ -104,7 +116,8 @@ def load_config(path: Path) -> BenchmarkConfig:
     raw = yaml.safe_load(path.read_text(encoding="utf-8"))
     if not isinstance(raw, dict):
         raise ValueError("configuration root must be a mapping")
-    missing = _TOP_KEYS - set(raw)
+    # Text is optional so pre-extension vector-only configurations keep working unchanged.
+    missing = (_TOP_KEYS - {"text"}) - set(raw)
     unknown = set(raw) - _TOP_KEYS
     if missing or unknown:
         raise ValueError(f"configuration keys: missing={sorted(missing)}, unknown={sorted(unknown)}")
@@ -140,6 +153,21 @@ def load_config(path: Path) -> BenchmarkConfig:
         raise ValueError("churn requires enabled, seconds, and target_ops_per_second")
     if not isinstance(churn_raw["enabled"], bool):
         raise ValueError("churn.enabled must be boolean")
+    text_raw = raw.get("text", {"enabled": False, "fts_candidates": 40, "rrf_k": 60})
+    text_keys = {
+        "enabled", "fts_candidates", "rrf_k", "topic_vocabulary_size",
+        "background_vocabulary_size",
+    }
+    if not isinstance(text_raw, dict):
+        raise ValueError("text must be a mapping")
+    if set(text_raw) - text_keys:
+        raise ValueError(f"text has unknown keys: {sorted(set(text_raw) - text_keys)}")
+    if not {"enabled", "fts_candidates", "rrf_k"} <= set(text_raw):
+        raise ValueError("text requires enabled, fts_candidates, and rrf_k")
+    if not isinstance(text_raw["enabled"], bool):
+        raise ValueError("text.enabled must be boolean")
+    if int(text_raw.get("topic_vocabulary_size", 60)) < 6:
+        raise ValueError("text.topic_vocabulary_size must be at least 6")
     engines_raw = raw["engines"]
     if not isinstance(engines_raw, dict) or set(engines_raw) != {"surrealdb", "postgres"}:
         raise ValueError("engines must define exactly surrealdb and postgres")
@@ -157,6 +185,18 @@ def load_config(path: Path) -> BenchmarkConfig:
         data_chunk_rows=int(_positive(raw["data_chunk_rows"], "data_chunk_rows")),
         ground_truth_batch_rows=int(_positive(raw["ground_truth_batch_rows"], "ground_truth_batch_rows")),
         postgres_modes=modes,
+        text=TextConfig(
+            enabled=text_raw["enabled"],
+            fts_candidates=int(_positive(text_raw["fts_candidates"], "text.fts_candidates")),
+            rrf_k=int(_positive(text_raw["rrf_k"], "text.rrf_k")),
+            topic_vocabulary_size=int(_positive(
+                text_raw.get("topic_vocabulary_size", 60), "text.topic_vocabulary_size"
+            )),
+            background_vocabulary_size=int(_positive(
+                text_raw.get("background_vocabulary_size", 2000),
+                "text.background_vocabulary_size",
+            )),
+        ),
         churn=ChurnConfig(churn_raw["enabled"], int(_positive(churn_raw["seconds"], "churn.seconds")),
                           int(_positive(churn_raw["target_ops_per_second"], "churn.target_ops_per_second"))),
         engines={name: _engine(name, value) for name, value in engines_raw.items()},

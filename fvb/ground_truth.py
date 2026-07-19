@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from pathlib import Path
+import math
+from collections.abc import Sequence
 from typing import Any, cast
 
 import numpy as np
@@ -51,3 +53,17 @@ def recall_at_k(actual: list[int], expected: np.ndarray, k: int) -> float:
     if not wanted:
         return 1.0 if not actual else 0.0
     return len(set(actual[:k]) & wanted) / len(wanted)
+
+
+def ndcg_at_k(relevances: Sequence[float], ideal_relevances: Sequence[float], k: int) -> float:
+    """Compute nDCG@K from observed and ideal graded relevance sequences."""
+    def dcg(values: Sequence[float]) -> float:
+        return float(sum(
+            (2.0 ** float(relevance) - 1.0) / math.log2(rank + 2)
+            for rank, relevance in enumerate(values[:k])
+        ))
+
+    ideal = dcg(sorted(ideal_relevances, reverse=True))
+    if ideal == 0:
+        return 0.0
+    return dcg(relevances) / ideal

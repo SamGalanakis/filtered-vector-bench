@@ -5,12 +5,15 @@ from pathlib import Path
 from typing import Any, cast
 
 import numpy as np
+import pytest
+import yaml
 from numpy.typing import NDArray
 
 from fvb.config import load_config
 from fvb.data import DataArtifacts
 from fvb.engines.base import Engine
 from fvb.engines.surrealdb import MAX_LOAD_PAYLOAD_BYTES, _insert_bodies
+from fvb.ground_truth import ndcg_at_k
 from fvb.memsample import MemorySampler
 from fvb.report import generate_report
 from fvb.runner import BenchmarkRunner, CellContext, _classify_failure, _failure_phase
@@ -32,6 +35,29 @@ class _FakeEngine:
 class _FakeSampler:
     def sample_now(self) -> None:
         pass
+
+
+def test_ndcg_at_10_matches_hand_calculation() -> None:
+    # Relevant documents at ranks 1 and 3: DCG = 1/log2(2) + 1/log2(4).
+    # The ideal ordering puts both at ranks 1 and 2.
+    expected = (1.0 + 0.5) / (1.0 + 1.0 / np.log2(3.0))
+
+    actual = ndcg_at_k([1.0, 0.0, 1.0, 0.0], [1.0, 1.0], 10)
+
+    assert actual == pytest.approx(expected)
+
+
+def test_legacy_config_without_text_remains_vector_only(tmp_path: Path) -> None:
+    raw = yaml.safe_load(Path("configs/smoke.yaml").read_text(encoding="utf-8"))
+    del raw["text"]
+    path = tmp_path / "vector-only.yaml"
+    path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+
+    config = load_config(path)
+
+    assert config.text.enabled is False
+    assert config.text.fts_candidates == 40
+    assert config.text.rrf_k == 60
 
 
 def test_disappeared_engine_near_cap_is_classified_with_load_phase() -> None:
