@@ -8,14 +8,20 @@ import subprocess
 import threading
 import time
 import traceback
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Iterable, Sequence, cast
 
 import numpy as np
 
 from fvb.config import BenchmarkConfig
-from fvb.data import DataArtifacts, generate_data, iter_rows, tenant_name
+from fvb.data import (
+    DataArtifacts,
+    generate_data,
+    iter_rows,
+    tenant_name,
+    text_queries_for_tier,
+)
 from fvb.engines.base import Engine, Row
 from fvb.engines.postgres import PostgresEngine
 from fvb.engines.surrealdb import SurrealDBEngine
@@ -121,8 +127,13 @@ class BenchmarkRunner:
         for dimensions in self.config.dimensions:
             for n_docs in self.config.scales:
                 artifacts = generate_data(self.config, dimensions, n_docs, self.data_root)
-                truth = compute_ground_truth(artifacts, self.config.selectivities, self.config.k,
-                                              self.config.ground_truth_batch_rows)
+                truth = (
+                    compute_ground_truth(
+                        artifacts, self.config.selectivities, self.config.k,
+                        self.config.ground_truth_batch_rows,
+                    )
+                    if self.config.suites.vector else None
+                )
                 for engine_name in self.engine_names:
                     context = CellContext(engine_name, dimensions, n_docs,
                                           self.output / "cells" / f"{engine_name}-d{dimensions}-n{n_docs}")
@@ -150,14 +161,18 @@ class BenchmarkRunner:
         process = getattr(engine, "process", None)
         return bool(process and process.poll() in (-9, 137))
 
-    def _run_cell(self, context: CellContext, artifacts: DataArtifacts, truth_path: Path) -> None:
+    def _run_cell(
+        self, context: CellContext, artifacts: DataArtifacts, truth_path: Path | None
+    ) -> None:
         context.directory.mkdir(parents=True, exist_ok=True)
         engine = self._engine(context)
         sampler = MemorySampler(context.directory / "memory.csv", engine.process_roots,
                                 lambda: context.phase)
         self.events.write("cell_start", cell_id=context.cell_id, engine=context.engine_name,
                           dimensions=context.dimensions, n_docs=context.n_docs,
-                          memory_cap_bytes=self.config.memory_cap_bytes)
+                          memory_cap_bytes=self.config.memory_cap_bytes,
+                          suites=asdict(self.config.suites),
+                          query_topics=self.config.query_topics)
         try:
             engine.prepare()
             ready = engine.start()
@@ -209,33 +224,41 @@ class BenchmarkRunner:
                               seconds=time.monotonic() - settle_started)
             sampler.sample_now()
 
-            queries = np.load(artifacts.queries, mmap_mode="r")
-            for repeat in (1, 2):
-                context.phase = f"cold_{repeat}:stop"
-                engine.stop()
-                context.phase = f"cold_{repeat}:start"
-                restart_ready = engine.start()
-                context.phase = f"cold_{repeat}:first_query"
-                sampler.sample_now()
-                ids, query_seconds = engine.query(queries[0], None, self.config.k,
-                                                  self.config.ef_values[0])
-                sampler.sample_now()
-                self.events.write("cold_open", cell_id=context.cell_id, repeat=repeat,
-                                  ready_seconds=restart_ready, first_query_seconds=query_seconds,
-                                  time_to_first_query_seconds=restart_ready + query_seconds,
-                                  result_count=len(ids), source_ids=ids)
-
-            self._suite(context, engine, artifacts, truth_path, "pre_churn", sampler)
-            if self.config.text.enabled:
+            if self.config.suites.vector:
+                assert truth_path is not None
+                queries = np.load(artifacts.queries, mmap_mode="r")
+                for repeat in (1, 2):
+                    context.phase = f"cold_{repeat}:stop"
+                    engine.stop()
+                    context.phase = f"cold_{repeat}:start"
+                    restart_ready = engine.start()
+                    context.phase = f"cold_{repeat}:first_query"
+                    sampler.sample_now()
+                    ids, query_seconds = engine.query(
+                        queries[0], None, self.config.k, self.config.ef_values[0]
+                    )
+                    sampler.sample_now()
+                    self.events.write(
+                        "cold_open", cell_id=context.cell_id, repeat=repeat,
+                        ready_seconds=restart_ready, first_query_seconds=query_seconds,
+                        time_to_first_query_seconds=restart_ready + query_seconds,
+                        result_count=len(ids), source_ids=ids,
+                    )
+                self._suite(context, engine, artifacts, truth_path, "pre_churn", sampler)
+            if self.config.text.enabled and self.config.suites.fts:
                 self._text_suite(context, engine, artifacts, sampler)
+            if self.config.text.enabled and self.config.suites.hybrid:
                 self._hybrid_suite(context, engine, artifacts, sampler)
             if self.config.churn.enabled:
                 changes = self._churn(context, engine, artifacts, sampler)
-                post_truth = self._post_churn_truth(artifacts, truth_path, changes)
-                self._suite(context, engine, artifacts, post_truth, "post_churn", sampler)
+                if self.config.suites.vector:
+                    assert truth_path is not None
+                    post_truth = self._post_churn_truth(artifacts, truth_path, changes)
+                    self._suite(context, engine, artifacts, post_truth, "post_churn", sampler)
             context.phase = "collect"
             self.events.write("cell_complete", cell_id=context.cell_id, outcome="ok",
-                              disk_bytes=engine.disk_bytes())
+                              disk_bytes=engine.disk_bytes(), suites=asdict(self.config.suites),
+                              query_topics=self.config.query_topics)
         except Exception as error:
             sampler.sample_now()
             peak_rss, peak_pss = sampler.peak_bytes()
@@ -248,7 +271,9 @@ class BenchmarkRunner:
                               error=repr(error), traceback=traceback.format_exc(),
                               memory_cap_bytes=self.config.memory_cap_bytes,
                               phase=failure_phase, failure_phase=failure_phase,
-                              peak_rss_bytes=peak_rss, peak_pss_bytes=peak_pss)
+                              peak_rss_bytes=peak_rss, peak_pss_bytes=peak_pss,
+                              suites=asdict(self.config.suites),
+                              query_topics=self.config.query_topics)
         finally:
             sampler.stop()
             try:
@@ -322,11 +347,12 @@ class BenchmarkRunner:
         """Run text-only filtered queries once per selectivity tier."""
         assert artifacts.query_texts is not None
         assert artifacts.document_clusters is not None
-        query_texts = np.load(artifacts.query_texts, mmap_mode="r")
-        query_clusters = np.load(artifacts.query_clusters, mmap_mode="r")
         document_clusters = np.load(artifacts.document_clusters, mmap_mode="r")
         tenants = np.load(artifacts.tenants, mmap_mode="r")
         for selectivity in self.config.selectivities:
+            query_texts, _, query_clusters = text_queries_for_tier(
+                artifacts, self.config.selectivities, selectivity
+            )
             tenant = tenant_name(selectivity)
             eligible = (np.ones(len(document_clusters), dtype=np.bool_) if tenant is None else
                         np.asarray(tenants == tenant, dtype=np.bool_))
@@ -334,6 +360,7 @@ class BenchmarkRunner:
                 np.asarray(document_clusters[eligible], dtype=np.int64),
                 minlength=self.config.clusters,
             )
+            relevant_pool_sizes = [int(relevant_counts[int(cluster)]) for cluster in query_clusters]
             suite_id = f"{context.cell_id}:fts_suite:s{selectivity}"
             first_query = bytes(query_texts[0]).decode("ascii")
             context.phase = f"fts_suite:s{selectivity}:explain"
@@ -368,6 +395,7 @@ class BenchmarkRunner:
                     selectivity=selectivity, query_index=query_index,
                     text_query=text_query, latency_seconds=wall, ndcg_at_10=ndcg,
                     result_count=len(ids), underfill=underfill, source_ids=ids,
+                    eligible_relevant_pool_size=relevant_pool_sizes[query_index],
                 )
             sampler.sample_now()
             self.events.write(
@@ -379,6 +407,10 @@ class BenchmarkRunner:
                 underfill_percent=100 * underfills / len(latencies),
                 mean_result_count=float(np.mean(result_counts)), plan=plan,
                 plan_uses_text_index=uses_index,
+                eligible_relevant_pool_sizes=relevant_pool_sizes,
+                min_eligible_relevant_pool_size=min(relevant_pool_sizes),
+                mean_eligible_relevant_pool_size=float(np.mean(relevant_pool_sizes)),
+                max_eligible_relevant_pool_size=max(relevant_pool_sizes),
                 surrealdb_score_zero_issue=bool(
                     getattr(engine, "text_score_zero_detected", False)
                 ),
@@ -389,12 +421,12 @@ class BenchmarkRunner:
         """Run one-statement vector + text RRF queries per selectivity and EF value."""
         assert artifacts.query_texts is not None
         assert artifacts.document_clusters is not None
-        vectors = np.load(artifacts.queries, mmap_mode="r")
-        query_texts = np.load(artifacts.query_texts, mmap_mode="r")
-        query_clusters = np.load(artifacts.query_clusters, mmap_mode="r")
         document_clusters = np.load(artifacts.document_clusters, mmap_mode="r")
         tenants = np.load(artifacts.tenants, mmap_mode="r")
         for selectivity in self.config.selectivities:
+            query_texts, vectors, query_clusters = text_queries_for_tier(
+                artifacts, self.config.selectivities, selectivity
+            )
             tenant = tenant_name(selectivity)
             eligible = (np.ones(len(document_clusters), dtype=np.bool_) if tenant is None else
                         np.asarray(tenants == tenant, dtype=np.bool_))
@@ -402,6 +434,7 @@ class BenchmarkRunner:
                 np.asarray(document_clusters[eligible], dtype=np.int64),
                 minlength=self.config.clusters,
             )
+            relevant_pool_sizes = [int(relevant_counts[int(cluster)]) for cluster in query_clusters]
             for ef in self.config.ef_values:
                 suite_id = f"{context.cell_id}:hybrid_suite:s{selectivity}:ef{ef}"
                 first_query = bytes(query_texts[0]).decode("ascii")
@@ -445,6 +478,7 @@ class BenchmarkRunner:
                         selectivity=selectivity, ef=ef, query_index=query_index,
                         text_query=text_query, latency_seconds=wall, ndcg_at_10=ndcg,
                         result_count=len(ids), underfill=underfill, source_ids=ids,
+                        eligible_relevant_pool_size=relevant_pool_sizes[query_index],
                     )
                 sampler.sample_now()
                 self.events.write(
@@ -459,6 +493,10 @@ class BenchmarkRunner:
                     mean_result_count=float(np.mean(result_counts)), plan=plan,
                     plan_uses_vector_index=uses_vector, plan_uses_text_index=uses_text,
                     plan_uses_both_indexes=uses_vector and uses_text,
+                    eligible_relevant_pool_sizes=relevant_pool_sizes,
+                    min_eligible_relevant_pool_size=min(relevant_pool_sizes),
+                    mean_eligible_relevant_pool_size=float(np.mean(relevant_pool_sizes)),
+                    max_eligible_relevant_pool_size=max(relevant_pool_sizes),
                     surrealdb_score_zero_issue=bool(
                         getattr(engine, "text_score_zero_detected", False)
                     ),

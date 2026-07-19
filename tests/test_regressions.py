@@ -10,7 +10,7 @@ import yaml
 from numpy.typing import NDArray
 
 from fvb.config import load_config
-from fvb.data import DataArtifacts
+from fvb.data import DataArtifacts, generate_data, tenant_name, text_queries_for_tier
 from fvb.engines.base import Engine
 from fvb.engines.surrealdb import MAX_LOAD_PAYLOAD_BYTES, _insert_bodies
 from fvb.ground_truth import ndcg_at_k
@@ -58,6 +58,47 @@ def test_legacy_config_without_text_remains_vector_only(tmp_path: Path) -> None:
     assert config.text.enabled is False
     assert config.text.fts_candidates == 40
     assert config.text.rrf_k == 60
+    assert config.suites.vector is True
+    assert config.suites.fts is True
+    assert config.suites.hybrid is True
+    assert config.query_topics == "global"
+
+
+def test_tenant_present_builds_per_tier_queries_with_large_relevant_pools(
+    tmp_path: Path,
+) -> None:
+    raw = yaml.safe_load(Path("configs/smoke.yaml").read_text(encoding="utf-8"))
+    raw.update({
+        "dimensions": [8],
+        "scales": [3000],
+        "selectivities": [1.0, 0.1, 0.01],
+        "clusters": 4,
+        "query_topics": "tenant_present",
+        "suites": {"vector": False, "fts": True, "hybrid": True},
+    })
+    path = tmp_path / "tenant-present.yaml"
+    path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    config = load_config(path)
+
+    artifacts = generate_data(config, 8, 3000, tmp_path / "data")
+
+    assert artifacts.tier_queries is not None
+    assert artifacts.tier_query_clusters is not None
+    assert artifacts.tier_query_texts is not None
+    document_clusters = np.load(cast(Path, artifacts.document_clusters), mmap_mode="r")
+    tenants = np.load(artifacts.tenants, mmap_mode="r")
+    for selectivity in config.selectivities:
+        texts, vectors, query_clusters = text_queries_for_tier(
+            artifacts, config.selectivities, selectivity
+        )
+        tenant = tenant_name(selectivity)
+        eligible = (np.ones(len(tenants), dtype=np.bool_) if tenant is None else
+                    np.asarray(tenants == tenant, dtype=np.bool_))
+        counts = np.bincount(document_clusters[eligible], minlength=config.clusters)
+        assert len(texts) == config.n_queries
+        assert vectors.shape == (config.n_queries, 8)
+        assert all(int(counts[int(cluster)]) >= 3 * config.k for cluster in query_clusters)
+        assert int(eligible.sum()) == round(3000 * selectivity)
 
 
 def test_disappeared_engine_near_cap_is_classified_with_load_phase() -> None:
@@ -157,6 +198,23 @@ def test_failed_scale_is_annotated_and_not_rendered_as_zero(tmp_path: Path) -> N
             "label": "pre_churn",
         },
         {
+            "event": "fts_suite_complete",
+            "cell_id": "surrealdb-d64-n5000",
+            "tier": "unfiltered",
+            "selectivity": 1.0,
+            "n_queries": 8,
+            "p50_ms": 3.0,
+            "p95_ms": 4.0,
+            "mean_ndcg_at_10": 0.9,
+            "underfill": 0,
+            "underfill_percent": 0.0,
+            "mean_result_count": 10.0,
+            "plan_uses_text_index": True,
+            "min_eligible_relevant_pool_size": 30,
+            "mean_eligible_relevant_pool_size": 30.0,
+            "max_eligible_relevant_pool_size": 30,
+        },
+        {
             "event": "cell_complete",
             "cell_id": "postgres-d64-n5000",
             "outcome": "ok",
@@ -183,3 +241,6 @@ def test_failed_scale_is_annotated_and_not_rendered_as_zero(tmp_path: Path) -> N
     )
     assert "exceeded cap during load" in memory_svg
     assert "SurrealDB: no data — exceeded memory cap during load at this scale" in recall_svg
+    summary = (tmp_path / "summary.md").read_text(encoding="utf-8")
+    assert "30/30.0/30" in summary
+    assert "0.9000" in summary

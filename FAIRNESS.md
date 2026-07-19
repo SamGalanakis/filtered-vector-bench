@@ -17,12 +17,26 @@ from the other clusters, plus a shared 2,000-term background vocabulary. Documen
 tokens; the topic/background draw is binomial with expected topic share 35%, and both vocabulary
 draws are Zipf-weighted. A document's RNG is derived from its source ID, so generation is invariant
 to chunking. Each 3–6-term text query uses the topic vocabulary belonging to its query vector's
-cluster. The same query mapping is reused across all selectivity tiers.
+cluster. The default `query_topics: global` mode reuses the same query mapping across all
+selectivity tiers, preserving the original workload.
+
+The opt-in `query_topics: tenant_present` mode constructs a separate deterministic query set for
+each tier. It admits only clusters with at least `ceil(3 × K)` same-cluster rows inside that tier,
+then draws both query text and query vectors from those clusters. Random independent tenant
+assignment can make that set empty at the narrowest tiers (notably 300 rows spread over 50
+clusters). In that case generation performs the minimum deterministic background-row swaps needed
+to give the tier's most-populated cluster the required pool, preserving the tenant's row count and
+leaving other filtered tenants untouched. The resulting tenant/topic correlation is intentional
+and is confined to this mode: it removes relevance-existence as a confound, but it must not be
+presented as the independent-assignment corpus. Per-query pool sizes and their per-tier
+minimum/mean/maximum are recorded in raw events.
 
 Full-text and hybrid quality use constructed same-cluster relevance within the eligible tenant
 subset: a same-cluster row has grade 1 and every other row grade 0. The report computes nDCG@10;
-when a tiny eligible subset contains no row from the query cluster, its ideal DCG is zero and the
-query receives nDCG 0. Exact top-K recall is deliberately not reported for text because engine
+in `global` mode, when a tiny eligible subset contains no row from the query cluster, its ideal DCG
+is zero and the query receives nDCG 0. In `tenant_present` mode, relevance and ideal DCG are
+computed against each tier's own query clusters, and every query has at least `3 × K` relevant
+eligible rows. Exact top-K recall is deliberately not reported for text because engine
 lexical scores are not a shared exact-distance ordering. nDCG against the constructed relevance is
 the shared standard for both FTS and hybrid.
 

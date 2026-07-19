@@ -49,6 +49,15 @@ def _number(value: float | None) -> str:
     return "—" if value is None else f"{value:,.3f}"
 
 
+def _relevant_pool_summary(row: dict[str, Any]) -> str:
+    minimum = row.get("min_eligible_relevant_pool_size")
+    mean = row.get("mean_eligible_relevant_pool_size")
+    maximum = row.get("max_eligible_relevant_pool_size")
+    if minimum is None or mean is None or maximum is None:
+        return "—"
+    return f"{int(minimum)}/{float(mean):.1f}/{int(maximum)}"
+
+
 def _normalized_suite(row: dict[str, Any]) -> dict[str, Any]:
     """Read both the current self-describing suite schema and historical events."""
     normalized = dict(row)
@@ -419,31 +428,33 @@ def _scale_charts(events: list[dict[str, Any]], charts: Path,
         _legend_if_present(axis)
         _save(figure, charts, f"memory-vs-scale-d{dimension}")
 
-        figure, axis = plt.subplots(figsize=(7.5, 5))
-        for engine_index, engine in enumerate(COLORS):
-            points = sorted(((_cell_parts(cell)[2], float(np.median(colds[cell])))
-                             for cell in colds if _engine(cell) == engine and
-                             _cell_parts(cell)[1] == dimension and
-                             outcomes.get(cell, {}).get("outcome", "ok") == "ok"))
-            if points:
-                axis.plot(*zip(*points), color=COLORS[engine], linewidth=2, marker="o", markersize=8,
-                          label=DISPLAY[engine])
-                offset = (engine_index - (len(COLORS) - 1) / 2) * 12
-                axis.annotate(DISPLAY[engine], points[-1], xytext=(5, offset),
-                              textcoords="offset points",
-                              color=COLORS[engine], va="center")
-        cold_rows = [{"cell_id": cell} for cell in colds
-                     if _cell_parts(cell)[1] == dimension and
-                     outcomes.get(cell, {}).get("outcome", "ok") == "ok"]
-        for slot, n_docs in enumerate(sorted({_cell_parts(cell)[2] for cell in dimension_cells})):
-            _annotate_missing(axis, [row for row in cold_rows
-                                     if _cell_parts(row["cell_id"])[2] == n_docs],
-                              outcomes, dimension, n_docs, slot)
-        _apply_style(axis, "Time to first query after restart", "Vectors", "Seconds")
-        axis.set_xscale("log")
-        axis.set_yscale("log")
-        _legend_if_present(axis)
-        _save(figure, charts, f"cold-open-vs-scale-d{dimension}")
+        if any(_cell_parts(cell)[1] == dimension for cell in colds):
+            figure, axis = plt.subplots(figsize=(7.5, 5))
+            for engine_index, engine in enumerate(COLORS):
+                points = sorted(((_cell_parts(cell)[2], float(np.median(colds[cell])))
+                                 for cell in colds if _engine(cell) == engine and
+                                 _cell_parts(cell)[1] == dimension and
+                                 outcomes.get(cell, {}).get("outcome", "ok") == "ok"))
+                if points:
+                    axis.plot(*zip(*points), color=COLORS[engine], linewidth=2, marker="o",
+                              markersize=8, label=DISPLAY[engine])
+                    offset = (engine_index - (len(COLORS) - 1) / 2) * 12
+                    axis.annotate(DISPLAY[engine], points[-1], xytext=(5, offset),
+                                  textcoords="offset points",
+                                  color=COLORS[engine], va="center")
+            cold_rows = [{"cell_id": cell} for cell in colds
+                         if _cell_parts(cell)[1] == dimension and
+                         outcomes.get(cell, {}).get("outcome", "ok") == "ok"]
+            for slot, n_docs in enumerate(sorted({_cell_parts(cell)[2]
+                                                  for cell in dimension_cells})):
+                _annotate_missing(axis, [row for row in cold_rows
+                                         if _cell_parts(row["cell_id"])[2] == n_docs],
+                                  outcomes, dimension, n_docs, slot)
+            _apply_style(axis, "Time to first query after restart", "Vectors", "Seconds")
+            axis.set_xscale("log")
+            axis.set_yscale("log")
+            _legend_if_present(axis)
+            _save(figure, charts, f"cold-open-vs-scale-d{dimension}")
 
         figure, axes = plt.subplots(1, 2, figsize=(13, 5))
         for axis, field, ylabel, title in (
@@ -600,23 +611,23 @@ def _markdown(events: list[dict[str, Any]], suites: list[dict[str, Any]],
                      f"{int(row['underfill'])}/{int(row.get('n_queries', 0))} "
                      f"({float(row['underfill_percent']):.2f}%) | {mean_results_text} |")
     lines += ["", "## Full-text suites", "",
-              "| Engine | Dims | Documents | Tier | Selectivity | Text index plan | nDCG@10 | p50 ms | p95 ms | Underfill | Mean results | Score issue #7290 |",
-              "|---|---:|---:|---|---:|---|---:|---:|---:|---:|---:|---|"]
+              "| Engine | Dims | Documents | Tier | Selectivity | Relevant pool min/mean/max | Text index plan | nDCG@10 | p50 ms | p95 ms | Underfill | Mean results | Score issue #7290 |",
+              "|---|---:|---:|---|---:|---:|---|---:|---:|---:|---:|---:|---|"]
     for row in sorted(fts, key=lambda item: (item["cell_id"], -float(item["selectivity"]))):
         engine, dimensions, n_docs = _cell_parts(row["cell_id"])
         gate = "yes" if row["plan_uses_text_index"] else "**NO**"
         issue = "**observed**" if row.get("surrealdb_score_zero_issue") else "no"
         lines.append(
             f"| {DISPLAY[engine]} | {dimensions} | {n_docs:,} | {row['tier']} | "
-            f"{100 * float(row['selectivity']):g}% | {gate} | "
+            f"{100 * float(row['selectivity']):g}% | {_relevant_pool_summary(row)} | {gate} | "
             f"{float(row['mean_ndcg_at_10']):.4f} | {float(row['p50_ms']):.3f} | "
             f"{float(row['p95_ms']):.3f} | {int(row['underfill'])}/"
             f"{int(row['n_queries'])} ({float(row['underfill_percent']):.2f}%) | "
             f"{float(row['mean_result_count']):.2f} | {issue} |"
         )
     lines += ["", "## Hybrid suites", "",
-              "| Engine | Dims | Documents | Tier | Selectivity | ef | Vector plan | Text plan | Both | nDCG@10 | p50 ms | p95 ms | Underfill | Mean results |",
-              "|---|---:|---:|---|---:|---:|---|---|---|---:|---:|---:|---:|---:|"]
+              "| Engine | Dims | Documents | Tier | Selectivity | Relevant pool min/mean/max | ef | Vector plan | Text plan | Both | nDCG@10 | p50 ms | p95 ms | Underfill | Mean results |",
+              "|---|---:|---:|---|---:|---:|---:|---|---|---|---:|---:|---:|---:|---:|"]
     for row in sorted(hybrid, key=lambda item: (
         item["cell_id"], -float(item["selectivity"]), int(item["ef"])
     )):
@@ -626,7 +637,8 @@ def _markdown(events: list[dict[str, Any]], suites: list[dict[str, Any]],
         )]
         lines.append(
             f"| {DISPLAY[engine]} | {dimensions} | {n_docs:,} | {row['tier']} | "
-            f"{100 * float(row['selectivity']):g}% | {row['ef']} | {gates[0]} | "
+            f"{100 * float(row['selectivity']):g}% | {_relevant_pool_summary(row)} | "
+            f"{row['ef']} | {gates[0]} | "
             f"{gates[1]} | {gates[2]} | {float(row['mean_ndcg_at_10']):.4f} | "
             f"{float(row['p50_ms']):.3f} | {float(row['p95_ms']):.3f} | "
             f"{int(row['underfill'])}/{int(row['n_queries'])} "
@@ -634,7 +646,10 @@ def _markdown(events: list[dict[str, Any]], suites: list[dict[str, Any]],
             f"{float(row['mean_result_count']):.2f} |"
         )
     lines += ["", "## Metadata", "", "```json",
-              json.dumps({"config_sha256": metadata["config_sha256"], "versions": versions,
+              json.dumps({"config_sha256": metadata["config_sha256"],
+                          "suites": metadata.get("config", {}).get("suites"),
+                          "query_topics": metadata.get("config", {}).get("query_topics"),
+                          "versions": versions,
                           "hardware_files": ["lscpu.txt", "meminfo.txt"]}, indent=2, sort_keys=True),
               "```", "", "Raw plans, per-query observations, and phase memory samples remain beside this report.", ""]
     return "\n".join(lines)
@@ -652,13 +667,12 @@ def generate_report(results: Path) -> None:
     events = _jsonl(results / "events.jsonl")
     peaks = _memory_peaks(results)
     outcomes = _effective_outcomes(events, peaks)
-    suites = [_normalized_suite(row) for row in events if row["event"] == "suite_complete"
-              and outcomes.get(row["cell_id"], {}).get("outcome", "ok") == "ok"]
-    fts = [row for row in events if row["event"] == "fts_suite_complete"
-           and outcomes.get(row["cell_id"], {}).get("outcome", "ok") == "ok"]
-    hybrid = [row for row in events if row["event"] == "hybrid_suite_complete"
-              and outcomes.get(row["cell_id"], {}).get("outcome", "ok") == "ok"]
-    _selectivity_figures(suites, outcomes, charts)
+    # Completed suites remain valid evidence even if a later suite kills the cell.
+    suites = [_normalized_suite(row) for row in events if row["event"] == "suite_complete"]
+    fts = [row for row in events if row["event"] == "fts_suite_complete"]
+    hybrid = [row for row in events if row["event"] == "hybrid_suite_complete"]
+    if suites:
+        _selectivity_figures(suites, outcomes, charts)
     _text_figures(fts, hybrid, outcomes, charts)
     _scale_charts(events, charts, outcomes, peaks)
     _churn_charts(suites, results, charts)

@@ -43,7 +43,8 @@ container and volume.
 Each `(engine, dimensions, document count)` cell generates or reuses deterministic memory-mapped
 data and exact eligible-subset ground truth. When text is enabled, every embedding cluster also
 gets deterministic topic documents and aligned text queries. The runner loads, settles, performs
-two cold restarts, runs every configured vector suite, then FTS and single-statement hybrid suites,
+the vector suite's two cold restarts when selected, then runs selected vector, FTS, and
+single-statement hybrid suites in that order,
 optionally applies churn, and collects disk, plan, latency, recall/nDCG, underfill, and process-tree
 memory data. A missing expected index node
 in `EXPLAIN` is recorded prominently but does not suppress the measurement. A process killed at
@@ -84,6 +85,11 @@ The optional `text` mapping controls `enabled`, hybrid candidate depth (`fts_can
 RRF smoothing constant (`rrf_k`). Topic and background vocabulary sizes default to 60 and 2,000;
 the smoke config deliberately uses smaller vocabularies. Omitting `text` preserves the original
 vector-only workload and schema.
+
+The optional `suites` mapping selects `vector`, `fts`, and `hybrid` independently and defaults all
+three to true. `query_topics` defaults to `global`; `tenant_present` creates per-tier text/vector
+queries only from topics with at least `ceil(3 × K)` relevant rows in that tier. The normalized
+selection and construction mode are recorded in metadata and cell events.
 
 ## Add an engine
 

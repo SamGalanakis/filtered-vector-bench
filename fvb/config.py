@@ -32,6 +32,15 @@ class TextConfig:
 
 
 @dataclass(frozen=True)
+class SuiteConfig:
+    """Benchmark suite selection."""
+
+    vector: bool
+    fts: bool
+    hybrid: bool
+
+
+@dataclass(frozen=True)
 class EngineConfig:
     """Engine launch configuration."""
 
@@ -61,6 +70,8 @@ class BenchmarkConfig:
     data_chunk_rows: int
     ground_truth_batch_rows: int
     postgres_modes: tuple[str, ...]
+    suites: SuiteConfig
+    query_topics: str
     text: TextConfig
     churn: ChurnConfig
     engines: dict[str, EngineConfig]
@@ -84,7 +95,7 @@ _TOP_KEYS = {
     "seed", "dimensions", "scales", "selectivities", "ef_values", "n_queries", "k",
     "clusters", "cluster_sigma", "batch_size", "settle_seconds", "client_timeout_seconds",
     "memory_cap_gib", "data_chunk_rows", "ground_truth_batch_rows", "postgres_modes", "churn",
-    "engines", "text",
+    "engines", "text", "suites", "query_topics",
 }
 
 
@@ -117,7 +128,7 @@ def load_config(path: Path) -> BenchmarkConfig:
     if not isinstance(raw, dict):
         raise ValueError("configuration root must be a mapping")
     # Text is optional so pre-extension vector-only configurations keep working unchanged.
-    missing = (_TOP_KEYS - {"text"}) - set(raw)
+    missing = (_TOP_KEYS - {"text", "suites", "query_topics"}) - set(raw)
     unknown = set(raw) - _TOP_KEYS
     if missing or unknown:
         raise ValueError(f"configuration keys: missing={sorted(missing)}, unknown={sorted(unknown)}")
@@ -168,6 +179,14 @@ def load_config(path: Path) -> BenchmarkConfig:
         raise ValueError("text.enabled must be boolean")
     if int(text_raw.get("topic_vocabulary_size", 60)) < 6:
         raise ValueError("text.topic_vocabulary_size must be at least 6")
+    suites_raw = raw.get("suites", {"vector": True, "fts": True, "hybrid": True})
+    if not isinstance(suites_raw, dict) or set(suites_raw) != {"vector", "fts", "hybrid"}:
+        raise ValueError("suites requires exactly vector, fts, and hybrid")
+    if any(not isinstance(value, bool) for value in suites_raw.values()):
+        raise ValueError("suites.vector, suites.fts, and suites.hybrid must be boolean")
+    query_topics = raw.get("query_topics", "global")
+    if query_topics not in {"global", "tenant_present"}:
+        raise ValueError("query_topics must be one of ['global', 'tenant_present']")
     engines_raw = raw["engines"]
     if not isinstance(engines_raw, dict) or set(engines_raw) != {"surrealdb", "postgres"}:
         raise ValueError("engines must define exactly surrealdb and postgres")
@@ -185,6 +204,11 @@ def load_config(path: Path) -> BenchmarkConfig:
         data_chunk_rows=int(_positive(raw["data_chunk_rows"], "data_chunk_rows")),
         ground_truth_batch_rows=int(_positive(raw["ground_truth_batch_rows"], "ground_truth_batch_rows")),
         postgres_modes=modes,
+        suites=SuiteConfig(
+            vector=suites_raw["vector"], fts=suites_raw["fts"],
+            hybrid=suites_raw["hybrid"],
+        ),
+        query_topics=query_topics,
         text=TextConfig(
             enabled=text_raw["enabled"],
             fts_candidates=int(_positive(text_raw["fts_candidates"], "text.fts_candidates")),

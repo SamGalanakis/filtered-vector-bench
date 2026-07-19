@@ -20,7 +20,7 @@ def _children(pid: int) -> set[int]:
             try:
                 fields = (entry / "stat").read_text().split()
                 parent = int(fields[3])
-            except (FileNotFoundError, PermissionError, IndexError, ValueError):
+            except (FileNotFoundError, PermissionError, ProcessLookupError, IndexError, ValueError):
                 continue
             if parent in found:
                 found.add(int(entry.name))
