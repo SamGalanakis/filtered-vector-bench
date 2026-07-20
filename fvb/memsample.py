@@ -38,6 +38,17 @@ def _kib(pid: int, filename: str, key: str) -> int:
     return 0
 
 
+def process_tree_memory_bytes(roots: list[int]) -> tuple[int, int, set[int]]:
+    """Return summed RSS/PSS bytes and PIDs for the supplied process trees."""
+    pids: set[int] = set()
+    for root in roots:
+        if root > 0 and Path(f"/proc/{root}").exists():
+            pids.update(_children(root))
+    rss = sum(_kib(pid, "status", "VmRSS") for pid in pids) * 1024
+    pss = sum(_kib(pid, "smaps_rollup", "Pss") for pid in pids) * 1024
+    return rss, pss, pids
+
+
 class MemorySampler:
     """Sample summed process-tree memory to a phase-labeled CSV."""
 
@@ -82,12 +93,7 @@ class MemorySampler:
             self._stop.wait(self.cadence_seconds)
 
     def _sample(self) -> None:
-        pids: set[int] = set()
-        for root in self.roots():
-            if root > 0 and Path(f"/proc/{root}").exists():
-                pids.update(_children(root))
-        rss = sum(_kib(pid, "status", "VmRSS") for pid in pids) * 1024
-        pss = sum(_kib(pid, "smaps_rollup", "Pss") for pid in pids) * 1024
+        rss, pss, pids = process_tree_memory_bytes(self.roots())
         phase = self.phase()
         with self._write_lock:
             old_rss, old_pss = self._peaks.get(phase, (0, 0))

@@ -55,6 +55,7 @@ class BenchmarkConfig:
     """Validated benchmark matrix and workload parameters."""
 
     seed: int
+    measurement_state: str
     dimensions: tuple[int, ...]
     scales: tuple[int, ...]
     selectivities: tuple[float, ...]
@@ -95,7 +96,7 @@ _TOP_KEYS = {
     "seed", "dimensions", "scales", "selectivities", "ef_values", "n_queries", "k",
     "clusters", "cluster_sigma", "batch_size", "settle_seconds", "client_timeout_seconds",
     "memory_cap_gib", "data_chunk_rows", "ground_truth_batch_rows", "postgres_modes", "churn",
-    "engines", "text", "suites", "query_topics",
+    "engines", "text", "suites", "query_topics", "measurement_state",
 }
 
 
@@ -128,7 +129,7 @@ def load_config(path: Path) -> BenchmarkConfig:
     if not isinstance(raw, dict):
         raise ValueError("configuration root must be a mapping")
     # Text is optional so pre-extension vector-only configurations keep working unchanged.
-    missing = (_TOP_KEYS - {"text", "suites", "query_topics"}) - set(raw)
+    missing = (_TOP_KEYS - {"text", "suites", "query_topics", "measurement_state"}) - set(raw)
     unknown = set(raw) - _TOP_KEYS
     if missing or unknown:
         raise ValueError(f"configuration keys: missing={sorted(missing)}, unknown={sorted(unknown)}")
@@ -187,12 +188,16 @@ def load_config(path: Path) -> BenchmarkConfig:
     query_topics = raw.get("query_topics", "global")
     if query_topics not in {"global", "tenant_present"}:
         raise ValueError("query_topics must be one of ['global', 'tenant_present']")
+    measurement_state = raw.get("measurement_state", "fresh")
+    if measurement_state not in {"fresh", "steady"}:
+        raise ValueError("measurement_state must be one of ['fresh', 'steady']")
     engines_raw = raw["engines"]
     if not isinstance(engines_raw, dict) or set(engines_raw) != {"surrealdb", "postgres"}:
         raise ValueError("engines must define exactly surrealdb and postgres")
 
     return BenchmarkConfig(
-        seed=int(raw["seed"]), dimensions=dimensions, scales=scales,
+        seed=int(raw["seed"]), measurement_state=measurement_state,
+        dimensions=dimensions, scales=scales,
         selectivities=selectivities, ef_values=ef_values,
         n_queries=int(_positive(raw["n_queries"], "n_queries")),
         k=int(_positive(raw["k"], "k")), clusters=int(_positive(raw["clusters"], "clusters")),

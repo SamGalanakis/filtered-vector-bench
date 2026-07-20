@@ -91,6 +91,13 @@ three to true. `query_topics` defaults to `global`; `tenant_present` creates per
 queries only from topics with at least `ceil(3 × K)` relevant rows in that tier. The normalized
 selection and construction mode are recorded in metadata and cell events.
 
+`measurement_state` defaults to `fresh`, preserving the fixed post-load settle behavior. In
+`steady` state, the runner waits for twelve consecutive 10-second process-tree RSS and data-dir
+disk observations with less than 1% change (up to 45 minutes), runs PostgreSQL ANALYZE and waits
+for autovacuum workers, cleanly restarts the engine, records that cold open, and discards one full
+warm-up pass before recording the normal suites. Reports label the state and can compare result
+directories with `scripts/report.py --compare <other-results>`.
+
 ## Add an engine
 
 1. Add `fvb/engines/<name>.py` implementing `Engine` from `fvb/engines/base.py`.

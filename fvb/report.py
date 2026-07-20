@@ -7,7 +7,7 @@ import json
 import math
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Sequence, cast
 
 import matplotlib
 
@@ -26,6 +26,7 @@ DISPLAY = {"surrealdb": "SurrealDB", "postgres": "PostgreSQL"}
 FAILURE = "#e34948"
 EF_STYLES: dict[int, Literal["-", "--"]] = {40: "-", 64: "--"}
 MODE_MARKERS = {"default": "o", "strict_order": "s", "relaxed_order": "^"}
+_REPORT_STATE = "fresh"
 
 
 def _jsonl(path: Path) -> list[dict[str, Any]]:
@@ -87,13 +88,148 @@ def _apply_style(axis: Axes, title: str, xlabel: str, ylabel: str) -> None:
         spine.set_color("#e5e7eb")
 
 
-def _save(figure: Figure, charts: Path, name: str) -> None:
+def _save(figure: Figure, charts: Path, name: str, state_label: str | None = None) -> None:
+    figure.text(0.995, 0.005, f"Measurement state: {state_label or _REPORT_STATE}",
+                ha="right", va="bottom",
+                color="#6b7280", fontsize=8)
     figure.patch.set_facecolor("#ffffff")
     figure.tight_layout()
     for extension in ("png", "svg"):
         figure.savefig(charts / f"{name}.{extension}", dpi=180, bbox_inches="tight",
                        facecolor="#ffffff")
     plt.close(figure)
+
+
+def _metadata(path: Path) -> dict[str, Any]:
+    return cast(dict[str, Any], json.loads(
+        (path / "metadata.json").read_text(encoding="utf-8")
+    ))
+
+
+def _measurement_state(metadata: dict[str, Any]) -> str:
+    """Treat result sets written before the state dimension as fresh."""
+    return str(metadata.get("config", {}).get("measurement_state", "fresh"))
+
+
+def _events_with_state(path: Path) -> list[dict[str, Any]]:
+    state = _measurement_state(_metadata(path))
+    events = _jsonl(path / "events.jsonl")
+    for row in events:
+        row.setdefault("measurement_state", state)
+    return events
+
+
+def _comparison_rows(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Normalize all three summary event types into p50 comparison records."""
+    rows: list[dict[str, Any]] = []
+    for event in events:
+        event_name = event.get("event")
+        if event_name not in {"suite_complete", "fts_suite_complete", "hybrid_suite_complete"}:
+            continue
+        if event_name == "suite_complete" and event.get("label") != "pre_churn":
+            continue
+        row = dict(event)
+        row["suite"] = {
+            "suite_complete": "vector",
+            "fts_suite_complete": "fts",
+            "hybrid_suite_complete": "hybrid",
+        }[str(event_name)]
+        row.setdefault("tier", "unfiltered" if float(row["selectivity"]) == 1.0 else
+                       f"tenant_s{format(float(row['selectivity']), '.8g').replace('.', '_')}")
+        row.setdefault("ef", None)
+        row.setdefault("mode", "default")
+        rows.append(row)
+    return rows
+
+
+def _comparison_key(row: dict[str, Any]) -> tuple[object, ...]:
+    engine, dimensions, n_docs = _cell_parts(str(row["cell_id"]))
+    return (row["suite"], engine, dimensions, n_docs, float(row["selectivity"]),
+            row.get("ef"), row.get("mode", "default"))
+
+
+def _matched_comparisons(rows: list[dict[str, Any]]) -> list[tuple[dict[str, Any],
+                                                                    dict[str, Any]]]:
+    by_state: dict[tuple[tuple[object, ...], str], dict[str, Any]] = {}
+    for row in rows:
+        by_state[(_comparison_key(row), str(row["measurement_state"]))] = row
+    pairs = []
+    for key in sorted({item[0] for item in by_state}, key=str):
+        fresh = by_state.get((key, "fresh"))
+        steady = by_state.get((key, "steady"))
+        if fresh is not None and steady is not None:
+            pairs.append((fresh, steady))
+    return pairs
+
+
+def _state_comparison_charts(rows: list[dict[str, Any]], charts: Path) -> None:
+    """Draw matched fresh/steady p50 bars with an exact two-pixel inter-bar gap."""
+    pairs = _matched_comparisons(rows)
+    families = sorted({
+        (str(fresh["suite"]), _cell_parts(str(fresh["cell_id"]))[1],
+         _cell_parts(str(fresh["cell_id"]))[2])
+        for fresh, _ in pairs
+    })
+    for suite, dimensions, n_docs in families:
+        family = [(fresh, steady) for fresh, steady in pairs
+                  if fresh["suite"] == suite and
+                  _cell_parts(str(fresh["cell_id"]))[1:] == (dimensions, n_docs)]
+        selectivities = sorted({float(fresh["selectivity"]) for fresh, _ in family}, reverse=True)
+        engines = [engine for engine in COLORS if any(
+            _engine(str(fresh["cell_id"])) == engine for fresh, _ in family
+        )]
+        if not selectivities or not engines:
+            continue
+        values: dict[tuple[float, str, str], list[float]] = defaultdict(list)
+        for fresh, steady in family:
+            engine = _engine(str(fresh["cell_id"]))
+            selectivity = float(fresh["selectivity"])
+            values[(selectivity, engine, "fresh")].append(float(fresh["p50_ms"]))
+            values[(selectivity, engine, "steady")].append(float(steady["p50_ms"]))
+
+        figure, axis = plt.subplots(figsize=(max(8.0, 1.8 * len(selectivities)), 5.5))
+        positions = np.arange(len(selectivities), dtype=np.float64)
+        axis.set_xticks(positions, [f"{100 * value:g}%" for value in selectivities])
+        axis.set_xlim(-0.6, len(selectivities) - 0.4)
+        _apply_style(
+            axis, f"{suite.upper()} fresh vs steady · {n_docs:,} × {dimensions}",
+            "Eligible corpus tier", "p50 latency (ms)",
+        )
+        figure.canvas.draw()
+        series = [(engine, state) for engine in engines for state in ("fresh", "steady")]
+        x_span = len(selectivities) + 0.2
+        gap = 2 * x_span / axis.bbox.width
+        group_width = 0.82
+        bar_width = (group_width - gap * (len(series) - 1)) / len(series)
+        for series_index, (engine, state) in enumerate(series):
+            offset = (series_index - (len(series) - 1) / 2) * (bar_width + gap)
+            plotted = [float(np.mean(values[(tier, engine, state)]))
+                       if values.get((tier, engine, state)) else math.nan
+                       for tier in selectivities]
+            bars = axis.bar(
+                positions + offset, plotted, bar_width, color=COLORS[engine],
+                alpha=0.52 if state == "fresh" else 1.0,
+                hatch="//" if state == "fresh" else None,
+                edgecolor=COLORS[engine], linewidth=0.5,
+            )
+            for bar, value in zip(bars, plotted):
+                if math.isfinite(value):
+                    axis.annotate(
+                        f"{value:,.1f}",
+                        (bar.get_x() + bar.get_width() / 2, bar.get_height()),
+                        xytext=(0, 3), textcoords="offset points", ha="center", va="bottom",
+                        fontsize=7, rotation=90, color="#1a1d23",
+                    )
+        engine_handles = [Patch(facecolor=COLORS[engine], label=DISPLAY[engine])
+                          for engine in engines]
+        state_handles = [
+            Patch(facecolor="#6b7280", alpha=0.52, hatch="//", label="fresh"),
+            Patch(facecolor="#6b7280", label="steady"),
+        ]
+        axis.legend(handles=[*engine_handles, *state_handles], frameon=False, ncol=2)
+        axis.set_yscale("log")
+        _save(figure, charts, f"fresh-vs-steady-{suite}-p50-d{dimensions}-n{n_docs}",
+              "fresh vs steady")
 
 
 def _rounded_bar(axis: Axes, center: float, width: float, value: float, color: str,
@@ -560,22 +696,77 @@ def _churn_charts(suites: list[dict[str, Any]], results: Path, charts: Path) -> 
     _save(figure, charts, "churn-recall-delta")
 
 
+def _comparison_markdown(
+    comparison_rows: list[dict[str, Any]],
+    comparison_peaks: dict[tuple[str, str], dict[str, float | str]],
+) -> list[str]:
+    """Return matched state latency and memory tables."""
+    pairs = _matched_comparisons(comparison_rows)
+    if not pairs:
+        return []
+    lines = [
+        "", "## Fresh vs steady", "",
+        "Only exact `(engine, dimensions, scale, suite, tier, ef, mode)` matches are shown.", "",
+        "| Suite | Engine | Dims | Scale | Tier | ef | Mode | Fresh p50 ms | Steady p50 ms | Steady − fresh ms | Change |",
+        "|---|---|---:|---:|---|---:|---|---:|---:|---:|---:|",
+    ]
+    for fresh, steady in sorted(pairs, key=lambda pair: (
+        str(pair[0]["suite"]), pair[0]["cell_id"], -float(pair[0]["selectivity"]),
+        -1 if pair[0].get("ef") is None else int(pair[0]["ef"]),
+        str(pair[0].get("mode", "default")),
+    )):
+        engine, dimensions, n_docs = _cell_parts(str(fresh["cell_id"]))
+        fresh_p50 = float(fresh["p50_ms"])
+        steady_p50 = float(steady["p50_ms"])
+        delta = steady_p50 - fresh_p50
+        percent = 100 * delta / fresh_p50 if fresh_p50 else math.nan
+        ef = "—" if fresh.get("ef") is None else str(fresh["ef"])
+        lines.append(
+            f"| {str(fresh['suite']).upper()} | {DISPLAY[engine]} | {dimensions} | "
+            f"{n_docs:,} | {fresh['tier']} | {ef} | {fresh.get('mode', 'default')} | "
+            f"{fresh_p50:.3f} | {steady_p50:.3f} | {delta:+.3f} | {percent:+.1f}% |"
+        )
+
+    peak_cells = sorted({cell for _, cell in comparison_peaks})
+    matched_peak_cells = [cell for cell in peak_cells
+                          if ("fresh", cell) in comparison_peaks and
+                          ("steady", cell) in comparison_peaks]
+    if matched_peak_cells:
+        lines += [
+            "", "### Peak process-tree memory", "",
+            "| Engine | Dims | Scale | Fresh peak PSS/RSS GiB | Steady peak PSS/RSS GiB | Delta GiB |",
+            "|---|---:|---:|---:|---:|---:|",
+        ]
+        for cell in matched_peak_cells:
+            engine, dimensions, n_docs = _cell_parts(cell)
+            fresh_peak = float(comparison_peaks[("fresh", cell)]["overall_pss"]) / 1024**3
+            steady_peak = float(comparison_peaks[("steady", cell)]["overall_pss"]) / 1024**3
+            lines.append(
+                f"| {DISPLAY[engine]} | {dimensions} | {n_docs:,} | {fresh_peak:.3f} | "
+                f"{steady_peak:.3f} | {steady_peak - fresh_peak:+.3f} |"
+            )
+    return lines
+
+
 def _markdown(events: list[dict[str, Any]], suites: list[dict[str, Any]],
               fts: list[dict[str, Any]], hybrid: list[dict[str, Any]], results: Path,
               peaks: dict[str, dict[str, float | str]],
-              outcomes: dict[str, dict[str, Any]]) -> str:
-    metadata = json.loads((results / "metadata.json").read_text(encoding="utf-8"))
+              outcomes: dict[str, dict[str, Any]], comparison_rows: list[dict[str, Any]],
+              comparison_peaks: dict[tuple[str, str], dict[str, float | str]]) -> str:
+    metadata = _metadata(results)
+    state = _measurement_state(metadata)
     versions = {row["cell_id"]: row["versions"] for row in events if row["event"] == "engine_versions"}
     loads = {row["cell_id"]: row for row in events if row["event"] == "load_complete"}
     colds: dict[str, list[float]] = defaultdict(list)
     for row in events:
         if row["event"] == "cold_open":
             colds[row["cell_id"]].append(float(row["time_to_first_query_seconds"]))
-    lines = ["# Benchmark summary", "", f"Config SHA-256: `{metadata['config_sha256']}`  ",
+    lines = ["# Benchmark summary", "", f"Measurement state: **{state}**  ",
+             f"Config SHA-256: `{metadata['config_sha256']}`  ",
              f"Host: `{metadata['hostname']}` · `{metadata['platform']}` · Python `{metadata['python']}`",
              "", "## Cell overview", "",
-             "| Engine | Dims | Vectors | Outcome | Version | Load rows/s | Queryable s | Load peak PSS/RSS GiB | Query peak PSS/RSS GiB | Cold first-query s |",
-             "|---|---:|---:|---|---|---:|---:|---:|---:|---:|"]
+             "| State | Engine | Dims | Vectors | Outcome | Version | Load rows/s | Queryable s | Load peak PSS/RSS GiB | Query peak PSS/RSS GiB | Cold first-query s |",
+             "|---|---|---:|---:|---|---|---:|---:|---:|---:|---:|"]
     cell_ids = sorted(set(loads) | set(outcomes), key=lambda cell: _cell_parts(cell)[1:])
     for cell in cell_ids:
         engine, dimensions, n_docs = _cell_parts(cell)
@@ -591,34 +782,48 @@ def _markdown(events: list[dict[str, Any]], suites: list[dict[str, Any]],
         load_pss = float(load.get("load_peak_pss_bytes") or
                          peaks.get(cell, {}).get("load_pss", 0.0))
         cold = float(np.median(colds[cell])) if cell in colds else None
-        lines.append(f"| {DISPLAY[engine]} | {dimensions} | {n_docs:,} | {outcome} | {version} | "
+        lines.append(f"| {state} | {DISPLAY[engine]} | {dimensions} | {n_docs:,} | {outcome} | {version} | "
                      f"{_number(rows_per_second)} | {_number(queryable)} | "
                      f"{_number(load_pss / 1024**3 if load_pss else None)} | "
                      f"{_number(pss / 1024**3 if pss else None)} | {_number(cold)} |")
+    quiescence = [row for row in events if row["event"] == "quiescence_complete"]
+    if quiescence:
+        lines += ["", "## Quiescence", "",
+                  "| State | Engine | Dims | Scale | Seconds | Samples | Stable samples | Cap hit | ANALYZE s | Autovacuum wait s |",
+                  "|---|---|---:|---:|---:|---:|---:|---|---:|---:|"]
+        for row in sorted(quiescence, key=lambda item: item["cell_id"]):
+            engine, dimensions, n_docs = _cell_parts(row["cell_id"])
+            lines.append(
+                f"| {row.get('measurement_state', state)} | {DISPLAY[engine]} | {dimensions} | "
+                f"{n_docs:,} | {float(row['seconds']):.3f} | {int(row['samples'])} | "
+                f"{int(row['stable_samples'])} | {str(bool(row['cap_hit'])).lower()} | "
+                f"{_number(row.get('analyze_seconds'))} | "
+                f"{_number(row.get('autovacuum_wait_seconds'))} |"
+            )
     lines += ["", "## Filtered suites", "",
-              "| Engine | Dims | Vectors | Stage | Tier | Selectivity | ef | Mode | Index plan | Recall@10 | p50 ms | p95 ms | Underfill | Mean results |",
-              "|---|---:|---:|---|---|---:|---:|---|---|---:|---:|---:|---:|---:|"]
+              "| State | Engine | Dims | Vectors | Stage | Tier | Selectivity | ef | Mode | Index plan | Recall@10 | p50 ms | p95 ms | Underfill | Mean results |",
+              "|---|---|---:|---:|---|---|---:|---:|---|---|---:|---:|---:|---:|---:|"]
     for row in sorted(suites, key=lambda item: (item["cell_id"], item["label"],
                                                 -float(item["selectivity"]), item["ef"], item["mode"])):
         engine, dimensions, n_docs = _cell_parts(row["cell_id"])
         gate = "yes" if row["plan_uses_index"] else "**NO**"
         mean_results = row.get("mean_result_count")
         mean_results_text = "—" if mean_results is None else f"{float(mean_results):.2f}"
-        lines.append(f"| {DISPLAY[engine]} | {dimensions} | {n_docs:,} | {row['label']} | "
+        lines.append(f"| {row.get('measurement_state', state)} | {DISPLAY[engine]} | {dimensions} | {n_docs:,} | {row['label']} | "
                      f"{row['tier']} | {100 * float(row['selectivity']):g}% | {row['ef']} | "
                      f"{row['mode']} | {gate} | {float(row['mean_recall_at_10']):.4f} | "
                      f"{float(row['p50_ms']):.3f} | {float(row['p95_ms']):.3f} | "
                      f"{int(row['underfill'])}/{int(row.get('n_queries', 0))} "
                      f"({float(row['underfill_percent']):.2f}%) | {mean_results_text} |")
     lines += ["", "## Full-text suites", "",
-              "| Engine | Dims | Documents | Tier | Selectivity | Relevant pool min/mean/max | Text index plan | nDCG@10 | p50 ms | p95 ms | Underfill | Mean results | Score issue #7290 |",
-              "|---|---:|---:|---|---:|---:|---|---:|---:|---:|---:|---:|---|"]
+              "| State | Engine | Dims | Documents | Tier | Selectivity | Relevant pool min/mean/max | Text index plan | nDCG@10 | p50 ms | p95 ms | Underfill | Mean results | Score issue #7290 |",
+              "|---|---|---:|---:|---|---:|---:|---|---:|---:|---:|---:|---:|---|"]
     for row in sorted(fts, key=lambda item: (item["cell_id"], -float(item["selectivity"]))):
         engine, dimensions, n_docs = _cell_parts(row["cell_id"])
         gate = "yes" if row["plan_uses_text_index"] else "**NO**"
         issue = "**observed**" if row.get("surrealdb_score_zero_issue") else "no"
         lines.append(
-            f"| {DISPLAY[engine]} | {dimensions} | {n_docs:,} | {row['tier']} | "
+            f"| {row.get('measurement_state', state)} | {DISPLAY[engine]} | {dimensions} | {n_docs:,} | {row['tier']} | "
             f"{100 * float(row['selectivity']):g}% | {_relevant_pool_summary(row)} | {gate} | "
             f"{float(row['mean_ndcg_at_10']):.4f} | {float(row['p50_ms']):.3f} | "
             f"{float(row['p95_ms']):.3f} | {int(row['underfill'])}/"
@@ -626,8 +831,8 @@ def _markdown(events: list[dict[str, Any]], suites: list[dict[str, Any]],
             f"{float(row['mean_result_count']):.2f} | {issue} |"
         )
     lines += ["", "## Hybrid suites", "",
-              "| Engine | Dims | Documents | Tier | Selectivity | Relevant pool min/mean/max | ef | Vector plan | Text plan | Both | nDCG@10 | p50 ms | p95 ms | Underfill | Mean results |",
-              "|---|---:|---:|---|---:|---:|---:|---|---|---|---:|---:|---:|---:|---:|"]
+              "| State | Engine | Dims | Documents | Tier | Selectivity | Relevant pool min/mean/max | ef | Vector plan | Text plan | Both | nDCG@10 | p50 ms | p95 ms | Underfill | Mean results |",
+              "|---|---|---:|---:|---|---:|---:|---:|---|---|---|---:|---:|---:|---:|---:|"]
     for row in sorted(hybrid, key=lambda item: (
         item["cell_id"], -float(item["selectivity"]), int(item["ef"])
     )):
@@ -636,7 +841,7 @@ def _markdown(events: list[dict[str, Any]], suites: list[dict[str, Any]],
             "plan_uses_vector_index", "plan_uses_text_index", "plan_uses_both_indexes"
         )]
         lines.append(
-            f"| {DISPLAY[engine]} | {dimensions} | {n_docs:,} | {row['tier']} | "
+            f"| {row.get('measurement_state', state)} | {DISPLAY[engine]} | {dimensions} | {n_docs:,} | {row['tier']} | "
             f"{100 * float(row['selectivity']):g}% | {_relevant_pool_summary(row)} | "
             f"{row['ef']} | {gates[0]} | "
             f"{gates[1]} | {gates[2]} | {float(row['mean_ndcg_at_10']):.4f} | "
@@ -645,8 +850,10 @@ def _markdown(events: list[dict[str, Any]], suites: list[dict[str, Any]],
             f"({float(row['underfill_percent']):.2f}%) | "
             f"{float(row['mean_result_count']):.2f} |"
         )
+    lines += _comparison_markdown(comparison_rows, comparison_peaks)
     lines += ["", "## Metadata", "", "```json",
               json.dumps({"config_sha256": metadata["config_sha256"],
+                          "measurement_state": state,
                           "suites": metadata.get("config", {}).get("suites"),
                           "query_topics": metadata.get("config", {}).get("query_topics"),
                           "versions": versions,
@@ -655,27 +862,43 @@ def _markdown(events: list[dict[str, Any]], suites: list[dict[str, Any]],
     return "\n".join(lines)
 
 
-def generate_report(results: Path) -> None:
+def generate_report(results: Path, comparisons: Sequence[Path] = ()) -> None:
     """Generate all available charts and the Markdown summary from raw files."""
     if not (results / "metadata.json").exists():
         raise FileNotFoundError(f"not a benchmark result directory: {results}")
+    global _REPORT_STATE
+    metadata = _metadata(results)
+    _REPORT_STATE = _measurement_state(metadata)
     charts = results / "charts"
     charts.mkdir(exist_ok=True)
     for pattern in ("*.png", "*.svg"):
         for old_chart in charts.glob(pattern):
             old_chart.unlink()
-    events = _jsonl(results / "events.jsonl")
+    events = _events_with_state(results)
     peaks = _memory_peaks(results)
     outcomes = _effective_outcomes(events, peaks)
     # Completed suites remain valid evidence even if a later suite kills the cell.
     suites = [_normalized_suite(row) for row in events if row["event"] == "suite_complete"]
     fts = [row for row in events if row["event"] == "fts_suite_complete"]
     hybrid = [row for row in events if row["event"] == "hybrid_suite_complete"]
+    all_comparison_events = list(events)
+    comparison_peaks = {(str(_REPORT_STATE), cell): peak for cell, peak in peaks.items()}
+    for comparison in comparisons:
+        if not (comparison / "metadata.json").exists():
+            raise FileNotFoundError(f"not a benchmark result directory: {comparison}")
+        comparison_events = _events_with_state(comparison)
+        all_comparison_events.extend(comparison_events)
+        comparison_state = _measurement_state(_metadata(comparison))
+        comparison_peaks.update({(comparison_state, cell): peak
+                                 for cell, peak in _memory_peaks(comparison).items()})
+    comparison_rows = _comparison_rows(all_comparison_events)
     if suites:
         _selectivity_figures(suites, outcomes, charts)
     _text_figures(fts, hybrid, outcomes, charts)
     _scale_charts(events, charts, outcomes, peaks)
     _churn_charts(suites, results, charts)
+    _state_comparison_charts(comparison_rows, charts)
     (results / "summary.md").write_text(
-        _markdown(events, suites, fts, hybrid, results, peaks, outcomes), encoding="utf-8"
+        _markdown(events, suites, fts, hybrid, results, peaks, outcomes,
+                  comparison_rows, comparison_peaks), encoding="utf-8"
     )

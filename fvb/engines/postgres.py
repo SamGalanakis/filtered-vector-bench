@@ -359,6 +359,20 @@ class PostgresEngine(Engine):
                 return int(result.stdout.split()[0])
         return directory_size(self.pgdata)
 
+    def analyze(self) -> None:
+        """Refresh table statistics after bulk load and quiescence."""
+        with psycopg.connect(self.dsn, autocommit=True) as connection:
+            connection.execute("ANALYZE item")
+
+    def background_maintenance_active(self) -> bool:
+        """Report whether any autovacuum worker is currently active."""
+        with psycopg.connect(self.dsn, autocommit=True) as connection:
+            row = connection.execute(
+                "SELECT EXISTS (SELECT 1 FROM pg_stat_activity "
+                "WHERE backend_type = 'autovacuum worker')"
+            ).fetchone()
+        return bool(row and row[0])
+
     def churn_once(self, operation: str, source_id: int, tenant: str,
                    vector: NDArray[np.float32]) -> None:
         """Apply one insert/upsert or delete transaction."""

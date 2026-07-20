@@ -121,6 +121,13 @@ class Engine(abc.ABC):
     def disk_bytes(self) -> int:
         """Return durable storage bytes for this cell."""
 
+    def analyze(self) -> None:
+        """Refresh optimizer statistics when the engine exposes that operation."""
+
+    def background_maintenance_active(self) -> bool:
+        """Return whether maintenance workers relevant to steady state are active."""
+        return False
+
     def churn_once(self, operation: str, source_id: int, tenant: str,
                    vector: NDArray[np.float32]) -> None:
         """Apply one mutation; adapters may override when churn is supported."""

@@ -17,8 +17,12 @@ def main() -> None:
     """Parse CLI arguments and generate report artifacts."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--results", type=Path, required=True)
+    parser.add_argument(
+        "--compare", type=Path, action="append", default=[],
+        help="additional result directory supplying another measurement state",
+    )
     args = parser.parse_args()
-    generate_report(args.results.resolve())
+    generate_report(args.results.resolve(), [path.resolve() for path in args.compare])
     print((args.results.resolve() / "summary.md"))
 
 

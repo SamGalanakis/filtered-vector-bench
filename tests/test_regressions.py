@@ -16,7 +16,13 @@ from fvb.engines.surrealdb import MAX_LOAD_PAYLOAD_BYTES, _insert_bodies
 from fvb.ground_truth import ndcg_at_k
 from fvb.memsample import MemorySampler
 from fvb.report import generate_report
-from fvb.runner import BenchmarkRunner, CellContext, _classify_failure, _failure_phase
+from fvb.runner import (
+    BenchmarkRunner,
+    CellContext,
+    _classify_failure,
+    _failure_phase,
+    detect_quiescence,
+)
 
 
 class _FakeEngine:
@@ -62,6 +68,39 @@ def test_legacy_config_without_text_remains_vector_only(tmp_path: Path) -> None:
     assert config.suites.fts is True
     assert config.suites.hybrid is True
     assert config.query_topics == "global"
+    assert config.measurement_state == "fresh"
+
+
+def test_quiescence_detector_accepts_converging_stream() -> None:
+    samples = [(1000 + 100 // (index + 1), 2000 + 100 // (index + 1))
+               for index in range(5)]
+    samples.extend([(1000, 2000)] * 13)
+
+    result = detect_quiescence(samples)
+
+    assert result.quiescent is True
+    assert result.cap_hit is False
+    assert result.stable_samples == 12
+
+
+def test_quiescence_detector_rejects_oscillating_stream() -> None:
+    samples = [(1000 if index % 2 else 1200, 2000 if index % 2 else 2400)
+               for index in range(30)]
+
+    result = detect_quiescence(samples)
+
+    assert result.quiescent is False
+    assert result.cap_hit is False
+
+
+def test_quiescence_detector_records_cap_hit() -> None:
+    samples = [(1000 + 20 * index, 2000 + 40 * index) for index in range(100)]
+
+    result = detect_quiescence(samples, max_samples=8)
+
+    assert result.quiescent is False
+    assert result.cap_hit is True
+    assert result.sample_count == 8
 
 
 def test_tenant_present_builds_per_tier_queries_with_large_relevant_pools(
@@ -163,11 +202,70 @@ def test_suite_complete_is_self_describing(tmp_path: Path) -> None:
     event = json.loads((tmp_path / "events.jsonl").read_text(encoding="utf-8").splitlines()[0])
     required = {
         "cell_id", "tier", "ef", "mode", "p50_ms", "p95_ms", "mean_recall_at_10",
-        "underfill", "mean_result_count", "plan", "plan_uses_index",
+        "underfill", "mean_result_count", "plan", "plan_uses_index", "measurement_state",
     }
     assert required <= event.keys()
     assert event["tier"] == "unfiltered"
     assert event["plan"] == "Index Scan using test_hnsw"
+    assert event["measurement_state"] == "fresh"
+
+
+def test_warmup_events_are_excluded_from_summary(tmp_path: Path) -> None:
+    metadata = {
+        "config_sha256": "test",
+        "hostname": "test",
+        "platform": "test",
+        "python": "3.13",
+        "config": {"measurement_state": "steady"},
+    }
+    (tmp_path / "metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
+    events = [
+        {
+            "event": "warmup_suite_complete",
+            "measurement_state": "steady",
+            "cell_id": "postgres-d64-n5000",
+            "label": "warmup",
+            "suite": "vector",
+            "selectivity": 1.0,
+            "ef": 40,
+            "mode": "default",
+            "n_queries": 8,
+            "p50_ms": 999999.0,
+        },
+        {
+            "event": "suite_complete",
+            "measurement_state": "steady",
+            "cell_id": "postgres-d64-n5000",
+            "tier": "unfiltered",
+            "selectivity": 1.0,
+            "ef": 40,
+            "mode": "default",
+            "p50_ms": 1.0,
+            "p95_ms": 2.0,
+            "mean_recall_at_10": 0.8,
+            "underfill": 0,
+            "underfill_percent": 0.0,
+            "mean_result_count": 10.0,
+            "plan": "Index Scan",
+            "plan_uses_index": True,
+            "label": "pre_churn",
+        },
+        {
+            "event": "cell_complete",
+            "measurement_state": "steady",
+            "cell_id": "postgres-d64-n5000",
+            "outcome": "ok",
+        },
+    ]
+    (tmp_path / "events.jsonl").write_text(
+        "".join(json.dumps(event) + "\n" for event in events), encoding="utf-8"
+    )
+
+    generate_report(tmp_path)
+
+    summary = (tmp_path / "summary.md").read_text(encoding="utf-8")
+    assert "Measurement state: **steady**" in summary
+    assert "999999" not in summary
 
 
 def test_failed_scale_is_annotated_and_not_rendered_as_zero(tmp_path: Path) -> None:

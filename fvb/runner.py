@@ -26,20 +26,80 @@ from fvb.engines.base import Engine, Row
 from fvb.engines.postgres import PostgresEngine
 from fvb.engines.surrealdb import SurrealDBEngine
 from fvb.ground_truth import compute_ground_truth, load_truth, ndcg_at_k, recall_at_k
-from fvb.memsample import MemorySampler
+from fvb.memsample import MemorySampler, process_tree_memory_bytes
+
+
+QUIESCENCE_CADENCE_SECONDS = 10.0
+QUIESCENCE_STABLE_SAMPLES = 12
+QUIESCENCE_RELATIVE_THRESHOLD = 0.01
+QUIESCENCE_CAP_SECONDS = 45 * 60.0
+
+
+@dataclass(frozen=True)
+class QuiescenceResult:
+    """Outcome of evaluating or observing a quiescence sample stream."""
+
+    quiescent: bool
+    cap_hit: bool
+    sample_count: int
+    stable_samples: int
+
+
+class QuiescenceDetector:
+    """Detect consecutive low-change RSS and disk observations."""
+
+    def __init__(self, stable_samples: int = QUIESCENCE_STABLE_SAMPLES,
+                 relative_threshold: float = QUIESCENCE_RELATIVE_THRESHOLD) -> None:
+        self.required = stable_samples
+        self.threshold = relative_threshold
+        self.previous: tuple[int, int] | None = None
+        self.sample_count = 0
+        self.stable_samples = 0
+
+    @staticmethod
+    def _relative_change(previous: int, current: int) -> float:
+        return abs(current - previous) / max(abs(previous), 1)
+
+    def observe(self, rss_bytes: int, disk_bytes: int) -> bool:
+        """Add one observation and return whether the stream is now quiescent."""
+        current = (rss_bytes, disk_bytes)
+        self.sample_count += 1
+        if self.previous is not None:
+            stable = all(
+                self._relative_change(old, new) < self.threshold
+                for old, new in zip(self.previous, current)
+            )
+            self.stable_samples = self.stable_samples + 1 if stable else 0
+        self.previous = current
+        return self.stable_samples >= self.required
+
+
+def detect_quiescence(samples: Iterable[tuple[int, int]], *, stable_samples: int = 12,
+                      relative_threshold: float = 0.01,
+                      max_samples: int | None = None) -> QuiescenceResult:
+    """Evaluate synthetic observations with an optional sample-count cap."""
+    detector = QuiescenceDetector(stable_samples, relative_threshold)
+    for rss_bytes, disk_bytes in samples:
+        if max_samples is not None and detector.sample_count >= max_samples:
+            break
+        if detector.observe(rss_bytes, disk_bytes):
+            return QuiescenceResult(True, False, detector.sample_count, detector.stable_samples)
+    cap_hit = max_samples is not None and detector.sample_count >= max_samples
+    return QuiescenceResult(False, cap_hit, detector.sample_count, detector.stable_samples)
 
 
 class JsonlWriter:
     """Thread-safe append-only JSONL writer."""
 
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, **default_fields: Any) -> None:
         self.path = path
+        self.default_fields = default_fields
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.lock = threading.Lock()
 
     def write(self, event: str, **fields: Any) -> None:
         """Append one timestamped event and flush it to disk."""
-        record = {"event": event, "unix_time": time.time(), **fields}
+        record = {"event": event, "unix_time": time.time(), **self.default_fields, **fields}
         with self.lock, self.path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(record, sort_keys=True, default=str) + "\n")
 
@@ -71,6 +131,11 @@ def _failure_phase(phase: str) -> str:
         return "churn"
     if phase.startswith("cold_"):
         return "cold_open"
+    if phase.startswith("steady_cold_open"):
+        return "steady_cold_open"
+    if phase.startswith("warmup:"):
+        parts = phase.split(":", 2)
+        return f"{parts[1]}_warmup"
     return phase.split(":", 1)[0]
 
 
@@ -112,9 +177,10 @@ class BenchmarkRunner:
         self.config = config
         self.output = output
         self.engine_names = engines
-        self.events = JsonlWriter(output / "events.jsonl")
-        self.queries = JsonlWriter(output / "queries.jsonl")
-        self.plans = JsonlWriter(output / "plans.jsonl")
+        state = {"measurement_state": config.measurement_state}
+        self.events = JsonlWriter(output / "events.jsonl", **state)
+        self.queries = JsonlWriter(output / "queries.jsonl", **state)
+        self.plans = JsonlWriter(output / "plans.jsonl", **state)
         repository = Path(__file__).resolve().parents[1]
         self.data_root = repository / "data"
         self.cache_root = repository / ".cache"
@@ -213,37 +279,41 @@ class BenchmarkRunner:
                               peak_pss_bytes=load_peak_pss)
             self.events.write("engine_versions", cell_id=context.cell_id, versions=engine.version())
 
-            context.phase = "settle"
-            sampler.sample_now()
-            settle_started = time.monotonic()
-            while time.monotonic() - settle_started < self.config.settle_seconds:
-                if not engine.alive():
-                    raise RuntimeError("engine exited during settle")
-                time.sleep(min(1.0, self.config.settle_seconds))
-            self.events.write("settle_complete", cell_id=context.cell_id,
-                              seconds=time.monotonic() - settle_started)
-            sampler.sample_now()
+            if self.config.measurement_state == "steady":
+                self._steady_protocol(context, engine, artifacts, sampler)
+            else:
+                context.phase = "settle"
+                sampler.sample_now()
+                settle_started = time.monotonic()
+                while time.monotonic() - settle_started < self.config.settle_seconds:
+                    if not engine.alive():
+                        raise RuntimeError("engine exited during settle")
+                    time.sleep(min(1.0, self.config.settle_seconds))
+                self.events.write("settle_complete", cell_id=context.cell_id,
+                                  seconds=time.monotonic() - settle_started)
+                sampler.sample_now()
 
             if self.config.suites.vector:
                 assert truth_path is not None
                 queries = np.load(artifacts.queries, mmap_mode="r")
-                for repeat in (1, 2):
-                    context.phase = f"cold_{repeat}:stop"
-                    engine.stop()
-                    context.phase = f"cold_{repeat}:start"
-                    restart_ready = engine.start()
-                    context.phase = f"cold_{repeat}:first_query"
-                    sampler.sample_now()
-                    ids, query_seconds = engine.query(
-                        queries[0], None, self.config.k, self.config.ef_values[0]
-                    )
-                    sampler.sample_now()
-                    self.events.write(
-                        "cold_open", cell_id=context.cell_id, repeat=repeat,
-                        ready_seconds=restart_ready, first_query_seconds=query_seconds,
-                        time_to_first_query_seconds=restart_ready + query_seconds,
-                        result_count=len(ids), source_ids=ids,
-                    )
+                if self.config.measurement_state == "fresh":
+                    for repeat in (1, 2):
+                        context.phase = f"cold_{repeat}:stop"
+                        engine.stop()
+                        context.phase = f"cold_{repeat}:start"
+                        restart_ready = engine.start()
+                        context.phase = f"cold_{repeat}:first_query"
+                        sampler.sample_now()
+                        ids, query_seconds = engine.query(
+                            queries[0], None, self.config.k, self.config.ef_values[0]
+                        )
+                        sampler.sample_now()
+                        self.events.write(
+                            "cold_open", cell_id=context.cell_id, repeat=repeat, label="normal",
+                            ready_seconds=restart_ready, first_query_seconds=query_seconds,
+                            time_to_first_query_seconds=restart_ready + query_seconds,
+                            result_count=len(ids), source_ids=ids, query_kind="vector",
+                        )
                 self._suite(context, engine, artifacts, truth_path, "pre_churn", sampler)
             if self.config.text.enabled and self.config.suites.fts:
                 self._text_suite(context, engine, artifacts, sampler)
@@ -282,6 +352,159 @@ class BenchmarkRunner:
                 cleanup = getattr(engine, "cleanup", None)
                 if cleanup:
                     cleanup()
+
+    def _steady_protocol(self, context: CellContext, engine: Engine,
+                         artifacts: DataArtifacts, sampler: MemorySampler) -> None:
+        """Wait for stability, cold-restart, and discard one complete warm-up pass."""
+        started = time.monotonic()
+        deadline = started + QUIESCENCE_CAP_SECONDS
+        detector = QuiescenceDetector()
+        quiescent = False
+        context.phase = "quiescence"
+        while True:
+            if not engine.alive():
+                raise RuntimeError("engine exited during quiescence wait")
+            rss_bytes, pss_bytes, pids = process_tree_memory_bytes(engine.process_roots())
+            disk_bytes = engine.disk_bytes()
+            quiescent = detector.observe(rss_bytes, disk_bytes)
+            elapsed = time.monotonic() - started
+            self.events.write(
+                "quiescence_sample", cell_id=context.cell_id,
+                sample=detector.sample_count, elapsed_seconds=elapsed,
+                stable_samples=detector.stable_samples, rss_bytes=rss_bytes,
+                pss_bytes=pss_bytes, disk_bytes=disk_bytes, pids=sorted(pids),
+            )
+            sampler.sample_now()
+            if quiescent or time.monotonic() >= deadline:
+                break
+            time.sleep(min(QUIESCENCE_CADENCE_SECONDS, deadline - time.monotonic()))
+
+        analyze_seconds: float | None = None
+        autovacuum_wait_seconds: float | None = None
+        autovacuum_active = False
+        if context.engine_name == "postgres":
+            context.phase = "quiescence:analyze"
+            analyze_started = time.monotonic()
+            engine.analyze()
+            analyze_seconds = time.monotonic() - analyze_started
+            autovacuum_started = time.monotonic()
+            while True:
+                autovacuum_active = engine.background_maintenance_active()
+                self.events.write(
+                    "autovacuum_sample", cell_id=context.cell_id,
+                    elapsed_seconds=time.monotonic() - started, active=autovacuum_active,
+                )
+                if not autovacuum_active or time.monotonic() >= deadline:
+                    break
+                time.sleep(min(QUIESCENCE_CADENCE_SECONDS, deadline - time.monotonic()))
+            autovacuum_wait_seconds = time.monotonic() - autovacuum_started
+
+        cap_hit = not quiescent or (autovacuum_active and time.monotonic() >= deadline)
+        self.events.write(
+            "quiescence_complete", cell_id=context.cell_id,
+            seconds=time.monotonic() - started, quiescent=quiescent, cap_hit=cap_hit,
+            samples=detector.sample_count, stable_samples=detector.stable_samples,
+            analyze_seconds=analyze_seconds,
+            autovacuum_wait_seconds=autovacuum_wait_seconds,
+            autovacuum_active_at_end=autovacuum_active,
+            cadence_seconds=QUIESCENCE_CADENCE_SECONDS,
+            required_stable_samples=QUIESCENCE_STABLE_SAMPLES,
+            relative_threshold=QUIESCENCE_RELATIVE_THRESHOLD,
+            cap_seconds=QUIESCENCE_CAP_SECONDS,
+        )
+
+        context.phase = "steady_cold_open:stop"
+        engine.stop()
+        context.phase = "steady_cold_open:start"
+        restart_ready = engine.start()
+        context.phase = "steady_cold_open:first_query"
+        sampler.sample_now()
+        ids, query_seconds, query_kind = self._first_query(engine, artifacts)
+        sampler.sample_now()
+        self.events.write(
+            "cold_open", cell_id=context.cell_id, label="steady_protocol", repeat=1,
+            ready_seconds=restart_ready, first_query_seconds=query_seconds,
+            time_to_first_query_seconds=restart_ready + query_seconds,
+            result_count=len(ids), source_ids=ids, query_kind=query_kind,
+        )
+        self._warmup(context, engine, artifacts, sampler)
+
+    def _first_query(self, engine: Engine,
+                     artifacts: DataArtifacts) -> tuple[list[int], float, str]:
+        """Run the first enabled suite's first query for the steady cold-open sample."""
+        if self.config.suites.vector:
+            vectors = np.load(artifacts.queries, mmap_mode="r")
+            ids, seconds = engine.query(
+                vectors[0], None, self.config.k, self.config.ef_values[0]
+            )
+            return ids, seconds, "vector"
+        query_texts, vectors, _ = text_queries_for_tier(
+            artifacts, self.config.selectivities, 1.0
+        )
+        text_query = bytes(query_texts[0]).decode("ascii")
+        if self.config.suites.fts:
+            ids, seconds = engine.text_query(text_query, None, self.config.k)
+            return ids, seconds, "fts"
+        ids, seconds = engine.hybrid_query(
+            vectors[0], text_query, None, self.config.k, self.config.ef_values[0],
+            self.config.text.fts_candidates, self.config.text.rrf_k,
+        )
+        return ids, seconds, "hybrid"
+
+    def _warmup(self, context: CellContext, engine: Engine,
+                artifacts: DataArtifacts, sampler: MemorySampler) -> None:
+        """Run every selected query set once without writing query or summary observations."""
+        self.events.write("warmup_start", cell_id=context.cell_id, label="warmup",
+                          suites=asdict(self.config.suites))
+        modes = self.config.postgres_modes if context.engine_name == "postgres" else ("default",)
+        if self.config.suites.vector:
+            vectors = np.load(artifacts.queries, mmap_mode="r")
+            for selectivity in self.config.selectivities:
+                tenant = tenant_name(selectivity)
+                for ef in self.config.ef_values:
+                    for mode in modes:
+                        context.phase = f"warmup:vector:s{selectivity}:ef{ef}:{mode}"
+                        for vector in vectors:
+                            engine.query(vector, tenant, self.config.k, ef, mode)
+                        self.events.write(
+                            "warmup_suite_complete", cell_id=context.cell_id, label="warmup",
+                            suite="vector", selectivity=selectivity, ef=ef, mode=mode,
+                            n_queries=len(vectors),
+                        )
+        if self.config.text.enabled and self.config.suites.fts:
+            for selectivity in self.config.selectivities:
+                query_texts, _, _ = text_queries_for_tier(
+                    artifacts, self.config.selectivities, selectivity
+                )
+                tenant = tenant_name(selectivity)
+                context.phase = f"warmup:fts:s{selectivity}"
+                for encoded_query in query_texts:
+                    engine.text_query(bytes(encoded_query).decode("ascii"), tenant, self.config.k)
+                self.events.write(
+                    "warmup_suite_complete", cell_id=context.cell_id, label="warmup",
+                    suite="fts", selectivity=selectivity, n_queries=len(query_texts),
+                )
+        if self.config.text.enabled and self.config.suites.hybrid:
+            for selectivity in self.config.selectivities:
+                query_texts, vectors, _ = text_queries_for_tier(
+                    artifacts, self.config.selectivities, selectivity
+                )
+                tenant = tenant_name(selectivity)
+                for ef in self.config.ef_values:
+                    context.phase = f"warmup:hybrid:s{selectivity}:ef{ef}"
+                    for query_index, vector in enumerate(vectors):
+                        engine.hybrid_query(
+                            vector, bytes(query_texts[query_index]).decode("ascii"), tenant,
+                            self.config.k, ef, self.config.text.fts_candidates,
+                            self.config.text.rrf_k,
+                        )
+                    self.events.write(
+                        "warmup_suite_complete", cell_id=context.cell_id, label="warmup",
+                        suite="hybrid", selectivity=selectivity, ef=ef,
+                        n_queries=len(vectors),
+                    )
+        sampler.sample_now()
+        self.events.write("warmup_complete", cell_id=context.cell_id, label="warmup")
 
     def _suite(self, context: CellContext, engine: Engine, artifacts: DataArtifacts,
                truth_path: Path, label: str, sampler: MemorySampler) -> None:
