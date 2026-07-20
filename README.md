@@ -160,3 +160,19 @@ Highlights:
 - **Fresh vs steady deltas are measured and reported**: compaction debt inflates fresh
   latencies (up to ~2x on unfiltered SurrealDB FTS at 300k, ~10-60% on many PostgreSQL
   cells) but explains none of the scale failures.
+
+### The SurrealDB 1M failure survives every control we tried
+
+The 1M memory-cap failure is not an artifact of one measurement choice. Separate SurrealDB-only,
+vector-only probes at 1M × 1024-dim (see `configs/cap-probe.yaml` and `configs/transport-matrix.yaml`):
+
+| Control varied | Result |
+|---|---|
+| Memory cap raised 48 → 55 GiB | Grew to **54.5 GiB and died anyway** in the filtered suite — took the extra headroom rather than completing. Growth is unbounded within tested limits. |
+| Transport HTTP → WebSocket | **Identical failure**: HTTP peaked at 47.6 GiB, WebSocket at 47.2 GiB, same phase (within 1%). |
+| Measurement state fresh → steady | Reproduces after full quiescence + restart + warm-up, so it is not compaction debt. |
+
+The one unfiltered tier that completed under the raised cap did so at **p50 29 s / p95 48 s** — even
+naive 1M ANN is impractically slow on this hardware before any filter is applied. A storage-backend
+control (RocksDB vs TiKV, to attribute the growth to the query engine vs the store) is implemented
+(`configs/backend-matrix.yaml`) but was not completed in these runs.
