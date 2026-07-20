@@ -16,6 +16,7 @@ dependencies = [
   "numpy>=2.2.0,<3",
   "psycopg[binary]>=3.2.3,<4",
   "PyYAML>=6.0.2,<7",
+  "websockets>=15.0.1,<16",
 ]
 
 [project.optional-dependencies]

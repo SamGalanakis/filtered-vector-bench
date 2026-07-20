@@ -48,6 +48,8 @@ class EngineConfig:
     image: str | None = None
     version: str | None = None
     binary: str | None = None
+    storage: str = "rocksdb"
+    transport: str = "http"
 
 
 @dataclass(frozen=True)
@@ -75,7 +77,7 @@ class BenchmarkConfig:
     query_topics: str
     text: TextConfig
     churn: ChurnConfig
-    engines: dict[str, EngineConfig]
+    engines: dict[str, tuple[EngineConfig, ...]]
 
     @property
     def memory_cap_bytes(self) -> int:
@@ -107,20 +109,49 @@ def _positive(value: Any, name: str, *, allow_float: bool = False) -> int | floa
     return float(value) if allow_float else int(value)
 
 
-def _engine(name: str, raw: Any) -> EngineConfig:
+def _engine(name: str, raw: Any, defaults: dict[str, Any] | None = None) -> EngineConfig:
     if not isinstance(raw, dict):
         raise ValueError(f"engines.{name} must be a mapping")
-    unknown = set(raw) - {"mode", "image", "version", "binary"}
+    values = {**(defaults or {}), **raw}
+    unknown = set(values) - {"mode", "image", "version", "binary", "storage", "transport"}
     if unknown:
         raise ValueError(f"unknown engines.{name} keys: {sorted(unknown)}")
-    mode = raw.get("mode")
+    mode = values.get("mode")
     allowed = {"docker", "binary"} if name == "surrealdb" else {"docker", "local"}
     if mode not in allowed:
         raise ValueError(f"engines.{name}.mode must be one of {sorted(allowed)}")
-    if mode == "docker" and not raw.get("image"):
+    if mode == "docker" and not values.get("image"):
         raise ValueError(f"engines.{name}.image is required for Docker mode")
-    return EngineConfig(mode=mode, image=raw.get("image"), version=raw.get("version"),
-                        binary=raw.get("binary"))
+    storage = values.get("storage", "rocksdb")
+    transport = values.get("transport", "http")
+    if name == "surrealdb":
+        if storage not in {"rocksdb", "tikv"}:
+            raise ValueError("engines.surrealdb.storage must be one of ['rocksdb', 'tikv']")
+        if transport not in {"http", "ws"}:
+            raise ValueError("engines.surrealdb.transport must be one of ['http', 'ws']")
+    elif "storage" in values or "transport" in values:
+        raise ValueError(f"engines.{name} does not support storage or transport")
+    return EngineConfig(mode=mode, image=values.get("image"), version=values.get("version"),
+                        binary=values.get("binary"), storage=storage, transport=transport)
+
+
+def _engine_matrix(name: str, raw: Any) -> tuple[EngineConfig, ...]:
+    """Validate one engine and expand its optional explicit cell variants."""
+    if not isinstance(raw, dict):
+        raise ValueError(f"engines.{name} must be a mapping")
+    variants = raw.get("variants")
+    base = {key: value for key, value in raw.items() if key != "variants"}
+    if variants is None:
+        return (_engine(name, base),)
+    if name != "surrealdb":
+        raise ValueError("only engines.surrealdb supports variants")
+    if not isinstance(variants, list) or not variants:
+        raise ValueError("engines.surrealdb.variants must be a non-empty list")
+    expanded = tuple(_engine(name, variant, base) for variant in variants)
+    identities = [(variant.storage, variant.transport) for variant in expanded]
+    if len(set(identities)) != len(identities):
+        raise ValueError("engines.surrealdb.variants must have unique storage/transport pairs")
+    return expanded
 
 
 def load_config(path: Path) -> BenchmarkConfig:
@@ -192,8 +223,9 @@ def load_config(path: Path) -> BenchmarkConfig:
     if measurement_state not in {"fresh", "steady"}:
         raise ValueError("measurement_state must be one of ['fresh', 'steady']")
     engines_raw = raw["engines"]
-    if not isinstance(engines_raw, dict) or set(engines_raw) != {"surrealdb", "postgres"}:
-        raise ValueError("engines must define exactly surrealdb and postgres")
+    if (not isinstance(engines_raw, dict) or not engines_raw or
+            set(engines_raw) - {"surrealdb", "postgres"}):
+        raise ValueError("engines must define one or more of surrealdb and postgres")
 
     return BenchmarkConfig(
         seed=int(raw["seed"]), measurement_state=measurement_state,
@@ -228,5 +260,5 @@ def load_config(path: Path) -> BenchmarkConfig:
         ),
         churn=ChurnConfig(churn_raw["enabled"], int(_positive(churn_raw["seconds"], "churn.seconds")),
                           int(_positive(churn_raw["target_ops_per_second"], "churn.target_ops_per_second"))),
-        engines={name: _engine(name, value) for name, value in engines_raw.items()},
+        engines={name: _engine_matrix(name, value) for name, value in engines_raw.items()},
     )

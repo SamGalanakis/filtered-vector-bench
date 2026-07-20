@@ -22,6 +22,7 @@ from fvb.runner import (
     _classify_failure,
     _failure_phase,
     detect_quiescence,
+    safe_memory_cap,
 )
 
 
@@ -69,6 +70,24 @@ def test_legacy_config_without_text_remains_vector_only(tmp_path: Path) -> None:
     assert config.suites.hybrid is True
     assert config.query_topics == "global"
     assert config.measurement_state == "fresh"
+    assert config.engines["surrealdb"][0].storage == "rocksdb"
+    assert config.engines["surrealdb"][0].transport == "http"
+
+
+def test_surrealdb_variants_expand_to_distinct_scalar_cells() -> None:
+    config = load_config(Path("configs/backend-matrix.yaml"))
+
+    assert set(config.engines) == {"surrealdb"}
+    assert [(cell.storage, cell.transport) for cell in config.engines["surrealdb"]] == [
+        ("rocksdb", "http"), ("tikv", "http"),
+    ]
+
+
+def test_cap_probe_uses_largest_safe_whole_gib() -> None:
+    gib = 1024**3
+
+    assert safe_memory_cap(100 * gib, 111 * gib) == 55 * gib
+    assert safe_memory_cap(48 * gib, 111 * gib) == 48 * gib
 
 
 def test_quiescence_detector_accepts_converging_stream() -> None:
@@ -150,6 +169,17 @@ def test_disappeared_engine_near_cap_is_classified_with_load_phase() -> None:
         memory_cap_bytes=cap,
     ) == "exceeded_memory_cap"
     assert _failure_phase("load:834000") == "load"
+
+
+def test_alive_engine_request_failure_near_cap_is_still_cap_exceedance() -> None:
+    cap = 48 * 1024**3
+
+    assert _classify_failure(
+        oom_detected=False,
+        engine_alive=True,
+        peak_rss_bytes=int(cap * 0.99),
+        memory_cap_bytes=cap,
+    ) == "exceeded_memory_cap"
 
 
 def test_disappeared_engine_well_below_cap_remains_an_error() -> None:

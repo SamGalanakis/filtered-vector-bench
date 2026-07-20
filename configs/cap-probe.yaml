@@ -1,0 +1,38 @@
+seed: 20250308
+measurement_state: fresh
+dimensions: [1024]
+scales: [1000000]
+selectivities: [1.0, 0.1, 0.01, 0.001]
+ef_values: [40, 64]
+n_queries: 100
+k: 10
+clusters: 50
+cluster_sigma: 0.12
+batch_size: 200
+settle_seconds: 120
+client_timeout_seconds: 120
+memory_cap_gib: 100
+data_chunk_rows: 10000
+ground_truth_batch_rows: 50000
+postgres_modes: [default]
+suites:
+  vector: true
+  fts: false
+  hybrid: false
+query_topics: tenant_present
+text:
+  enabled: false
+  fts_candidates: 40
+  rrf_k: 60
+  topic_vocabulary_size: 60
+  background_vocabulary_size: 2000
+churn:
+  enabled: false
+  seconds: 120
+  target_ops_per_second: 50
+engines:
+  surrealdb:
+    mode: binary
+    version: v3.2.1
+    storage: rocksdb
+    transport: http

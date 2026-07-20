@@ -21,8 +21,22 @@ from matplotlib.patches import Patch, PathPatch
 from matplotlib.path import Path as PlotPath
 
 
-COLORS = {"surrealdb": "#2a78d6", "postgres": "#008300"}
-DISPLAY = {"surrealdb": "SurrealDB", "postgres": "PostgreSQL"}
+COLORS = {
+    "surrealdb": "#2a78d6",
+    "surrealdb-rocksdb-http": "#2a78d6",
+    "surrealdb-rocksdb-ws": "#7558c9",
+    "surrealdb-tikv-http": "#e08a19",
+    "surrealdb-tikv-ws": "#d34f73",
+    "postgres": "#008300",
+}
+DISPLAY = {
+    "surrealdb": "SurrealDB",
+    "surrealdb-rocksdb-http": "SurrealDB · RocksDB · HTTP",
+    "surrealdb-rocksdb-ws": "SurrealDB · RocksDB · WebSocket",
+    "surrealdb-tikv-http": "SurrealDB · TiKV · HTTP",
+    "surrealdb-tikv-ws": "SurrealDB · TiKV · WebSocket",
+    "postgres": "PostgreSQL",
+}
 FAILURE = "#e34948"
 EF_STYLES: dict[int, Literal["-", "--"]] = {40: "-", 64: "--"}
 MODE_MARKERS = {"default": "o", "strict_order": "s", "relaxed_order": "^"}
@@ -476,25 +490,47 @@ def _memory_peaks(results: Path) -> dict[str, dict[str, float | str]]:
     for memory_file in (results / "cells").glob("*/memory.csv") if (results / "cells").exists() else []:
         cell_id = memory_file.parent.name
         peak_rss = peak_pss = load_rss = load_pss = overall_rss = overall_pss = 0.0
+        surreal_rss = surreal_pss = tikv_rss = tikv_pss = 0.0
+        query_surreal_rss = query_surreal_pss = query_tikv_rss = query_tikv_pss = 0.0
         peak_phase = "unknown"
         with memory_file.open(encoding="utf-8") as handle:
             for row in csv.DictReader(handle):
                 rss = float(row["rss_bytes"])
                 pss = float(row["pss_bytes"])
+                row_surreal_rss = float(row.get("surrealdb_rss_bytes") or 0)
+                row_surreal_pss = float(row.get("surrealdb_pss_bytes") or 0)
+                row_tikv_rss = float(row.get("tikv_pd_rss_bytes") or 0)
+                row_tikv_pss = float(row.get("tikv_pd_pss_bytes") or 0)
                 if rss > overall_rss:
                     peak_phase = row["phase"]
                 overall_rss = max(overall_rss, rss)
                 overall_pss = max(overall_pss, pss)
+                surreal_rss = max(surreal_rss, row_surreal_rss)
+                surreal_pss = max(surreal_pss, row_surreal_pss)
+                tikv_rss = max(tikv_rss, row_tikv_rss)
+                tikv_pss = max(tikv_pss, row_tikv_pss)
                 if row["phase"].startswith("load"):
                     load_rss = max(load_rss, rss)
                     load_pss = max(load_pss, pss)
                 if "queries" in row["phase"] or row["phase"] == "churn":
                     peak_rss = max(peak_rss, rss)
                     peak_pss = max(peak_pss, pss)
+                    query_surreal_rss = max(query_surreal_rss, row_surreal_rss)
+                    query_surreal_pss = max(query_surreal_pss, row_surreal_pss)
+                    query_tikv_rss = max(query_tikv_rss, row_tikv_rss)
+                    query_tikv_pss = max(query_tikv_pss, row_tikv_pss)
         peaks[cell_id] = {
             "rss": peak_rss, "pss": peak_pss or peak_rss,
             "load_rss": load_rss, "load_pss": load_pss or load_rss,
             "overall_rss": overall_rss, "overall_pss": overall_pss or overall_rss,
+            "surrealdb_overall_rss": surreal_rss,
+            "surrealdb_overall_pss": surreal_pss or surreal_rss,
+            "tikv_pd_overall_rss": tikv_rss,
+            "tikv_pd_overall_pss": tikv_pss or tikv_rss,
+            "surrealdb_query_rss": query_surreal_rss,
+            "surrealdb_query_pss": query_surreal_pss or query_surreal_rss,
+            "tikv_pd_query_rss": query_tikv_rss,
+            "tikv_pd_query_pss": query_tikv_pss or query_tikv_rss,
             "peak_phase": peak_phase,
         }
     return peaks
@@ -515,8 +551,9 @@ def _effective_outcomes(events: list[dict[str, Any]],
     for cell, row in outcomes.items():
         peak = peaks.get(cell, {})
         cap = int(row.get("memory_cap_bytes", 0))
-        overall_rss = float(peak.get("overall_rss", 0.0))
-        near_cap = cap and abs(overall_rss - cap) <= cap * 0.05
+        cap_tree_rss = float(peak.get("surrealdb_overall_rss", 0.0) or
+                             peak.get("overall_rss", 0.0))
+        near_cap = cap and abs(cap_tree_rss - cap) <= cap * 0.05
         if row.get("outcome") == "error" and near_cap:
             row["outcome"] = "exceeded_memory_cap"
             row["failure_phase"] = _phase_label(str(peak.get("peak_phase", "unknown")))
@@ -563,6 +600,37 @@ def _scale_charts(events: list[dict[str, Any]], charts: Path,
         axis.set_xscale("log")
         _legend_if_present(axis)
         _save(figure, charts, f"memory-vs-scale-d{dimension}")
+
+        split_cells = [cell for cell in dimension_cells if cell in peaks and
+                       (float(peaks[cell].get("surrealdb_overall_pss", 0.0)) > 0 or
+                        float(peaks[cell].get("tikv_pd_overall_pss", 0.0)) > 0)]
+        if split_cells:
+            split_cells.sort(key=lambda cell: (_cell_parts(cell)[2], _engine(cell)))
+            figure, axis = plt.subplots(figsize=(max(8.0, 1.7 * len(split_cells)), 5.5))
+            positions = np.arange(len(split_cells))
+            surreal_values = np.array([
+                float(peaks[cell].get("surrealdb_overall_pss", 0.0)) / 1024**3
+                for cell in split_cells
+            ])
+            tikv_values = np.array([
+                float(peaks[cell].get("tikv_pd_overall_pss", 0.0)) / 1024**3
+                for cell in split_cells
+            ])
+            axis.bar(positions, surreal_values, color="#2a78d6", label="SurrealDB process tree")
+            axis.bar(positions, tikv_values, bottom=surreal_values, color="#e08a19",
+                     label="TiKV + PD process trees")
+            axis.set_xticks(positions, [
+                f"{DISPLAY[_engine(cell)]}\n{_cell_parts(cell)[2]:,} vectors"
+                for cell in split_cells
+            ], rotation=15, ha="right")
+            _apply_style(axis, "Peak memory attribution by process tree", "Cell",
+                         "PSS (GiB; RSS fallback)")
+            axis.legend(frameon=False)
+            axis.text(
+                0.01, 0.99, "Component peaks may occur at different samples; total-series peak is separate.",
+                transform=axis.transAxes, va="top", color="#6b7280", fontsize=8,
+            )
+            _save(figure, charts, f"memory-process-split-d{dimension}")
 
         if any(_cell_parts(cell)[1] == dimension for cell in colds):
             figure, axis = plt.subplots(figsize=(7.5, 5))
@@ -756,6 +824,7 @@ def _markdown(events: list[dict[str, Any]], suites: list[dict[str, Any]],
     metadata = _metadata(results)
     state = _measurement_state(metadata)
     versions = {row["cell_id"]: row["versions"] for row in events if row["event"] == "engine_versions"}
+    starts = {row["cell_id"]: row for row in events if row["event"] == "cell_start"}
     loads = {row["cell_id"]: row for row in events if row["event"] == "load_complete"}
     colds: dict[str, list[float]] = defaultdict(list)
     for row in events:
@@ -765,8 +834,8 @@ def _markdown(events: list[dict[str, Any]], suites: list[dict[str, Any]],
              f"Config SHA-256: `{metadata['config_sha256']}`  ",
              f"Host: `{metadata['hostname']}` · `{metadata['platform']}` · Python `{metadata['python']}`",
              "", "## Cell overview", "",
-             "| State | Engine | Dims | Vectors | Outcome | Version | Load rows/s | Queryable s | Load peak PSS/RSS GiB | Query peak PSS/RSS GiB | Cold first-query s |",
-             "|---|---|---:|---:|---|---|---:|---:|---:|---:|---:|"]
+             "| State | Engine | Storage | Transport | Dims | Vectors | Outcome | Version | Load rows/s | Queryable s | Load peak total GiB | Query peak total GiB | SurrealDB peak GiB | TiKV+PD peak GiB | Overall total peak GiB | Cold first-query s |",
+             "|---|---|---|---|---:|---:|---|---|---:|---:|---:|---:|---:|---:|---:|---:|"]
     cell_ids = sorted(set(loads) | set(outcomes), key=lambda cell: _cell_parts(cell)[1:])
     for cell in cell_ids:
         engine, dimensions, n_docs = _cell_parts(cell)
@@ -782,10 +851,18 @@ def _markdown(events: list[dict[str, Any]], suites: list[dict[str, Any]],
         load_pss = float(load.get("load_peak_pss_bytes") or
                          peaks.get(cell, {}).get("load_pss", 0.0))
         cold = float(np.median(colds[cell])) if cell in colds else None
-        lines.append(f"| {state} | {DISPLAY[engine]} | {dimensions} | {n_docs:,} | {outcome} | {version} | "
+        start = starts.get(cell, {})
+        surreal_peak = float(peaks.get(cell, {}).get("surrealdb_overall_pss", 0.0))
+        tikv_peak = float(peaks.get(cell, {}).get("tikv_pd_overall_pss", 0.0))
+        total_peak = float(peaks.get(cell, {}).get("overall_pss", 0.0))
+        lines.append(f"| {state} | {DISPLAY[engine]} | {start.get('storage', '—')} | "
+                     f"{start.get('transport', '—')} | {dimensions} | {n_docs:,} | {outcome} | {version} | "
                      f"{_number(rows_per_second)} | {_number(queryable)} | "
                      f"{_number(load_pss / 1024**3 if load_pss else None)} | "
-                     f"{_number(pss / 1024**3 if pss else None)} | {_number(cold)} |")
+                     f"{_number(pss / 1024**3 if pss else None)} | "
+                     f"{_number(surreal_peak / 1024**3 if surreal_peak else None)} | "
+                     f"{_number(tikv_peak / 1024**3 if tikv_peak else None)} | "
+                     f"{_number(total_peak / 1024**3 if total_peak else None)} | {_number(cold)} |")
     quiescence = [row for row in events if row["event"] == "quiescence_complete"]
     if quiescence:
         lines += ["", "## Quiescence", "",

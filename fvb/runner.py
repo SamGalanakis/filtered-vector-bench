@@ -14,7 +14,7 @@ from typing import Any, Iterable, Sequence, cast
 
 import numpy as np
 
-from fvb.config import BenchmarkConfig
+from fvb.config import BenchmarkConfig, EngineConfig
 from fvb.data import (
     DataArtifacts,
     generate_data,
@@ -112,11 +112,16 @@ class CellContext:
     dimensions: int
     n_docs: int
     directory: Path
+    settings: EngineConfig | None = None
+    variant_label: str | None = None
     phase: str = "prepare"
 
     @property
     def cell_id(self) -> str:
-        return f"{self.engine_name}-d{self.dimensions}-n{self.n_docs}"
+        prefix = self.engine_name
+        if self.variant_label:
+            prefix += f"-{self.variant_label}"
+        return f"{prefix}-d{self.dimensions}-n{self.n_docs}"
 
 
 def _failure_phase(phase: str) -> str:
@@ -141,9 +146,9 @@ def _failure_phase(phase: str) -> str:
 
 def _classify_failure(*, oom_detected: bool, engine_alive: bool, peak_rss_bytes: int,
                       memory_cap_bytes: int) -> str:
-    """Classify explicit OOMs and near-cap process disappearance as cap exceedance."""
+    """Classify explicit OOMs and any near-cap request failure as cap exceedance."""
     near_cap = abs(peak_rss_bytes - memory_cap_bytes) <= int(memory_cap_bytes * 0.05)
-    return "exceeded_memory_cap" if oom_detected or (not engine_alive and near_cap) else "error"
+    return "exceeded_memory_cap" if oom_detected or near_cap else "error"
 
 
 def _command_output(command: list[str]) -> str:
@@ -153,13 +158,39 @@ def _command_output(command: list[str]) -> str:
         return "unavailable\n"
 
 
-def write_metadata(config: BenchmarkConfig, output: Path) -> None:
+def _available_memory_bytes() -> int:
+    """Read Linux MemAvailable for the run-start cap safety check."""
+    try:
+        for line in Path("/proc/meminfo").read_text(encoding="utf-8").splitlines():
+            if line.startswith("MemAvailable:"):
+                return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return 0
+
+
+def safe_memory_cap(requested_bytes: int, available_bytes: int) -> int:
+    """Limit a requested cap to the largest whole GiB no greater than half available."""
+    if not available_bytes or requested_bytes <= available_bytes // 2:
+        return requested_bytes
+    gib = 1024**3
+    return max(gib, (available_bytes // 2 // gib) * gib)
+
+
+def write_metadata(config: BenchmarkConfig, output: Path, *, available_memory_bytes: int,
+                   effective_memory_cap_bytes: int) -> None:
     """Capture normalized configuration, hash, and host evidence."""
     output.mkdir(parents=True, exist_ok=True)
     metadata = {
         "started_at_unix": time.time(), "config": config.normalized(),
         "config_sha256": config.sha256(), "platform": platform.platform(),
         "python": platform.python_version(), "hostname": platform.node(),
+        "memory_preflight": {
+            "available_memory_bytes": available_memory_bytes,
+            "requested_memory_cap_bytes": config.memory_cap_bytes,
+            "effective_memory_cap_bytes": effective_memory_cap_bytes,
+            "half_available_rule_applied": effective_memory_cap_bytes < config.memory_cap_bytes,
+        },
     }
     (output / "metadata.json").write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n",
                                           encoding="utf-8")
@@ -177,6 +208,13 @@ class BenchmarkRunner:
         self.config = config
         self.output = output
         self.engine_names = engines
+        missing_engines = set(engines) - set(config.engines)
+        if missing_engines:
+            raise ValueError(f"requested engines are not configured: {sorted(missing_engines)}")
+        self.available_memory_bytes = _available_memory_bytes()
+        self.memory_cap_bytes = safe_memory_cap(
+            config.memory_cap_bytes, self.available_memory_bytes
+        )
         state = {"measurement_state": config.measurement_state}
         self.events = JsonlWriter(output / "events.jsonl", **state)
         self.queries = JsonlWriter(output / "queries.jsonl", **state)
@@ -189,7 +227,10 @@ class BenchmarkRunner:
 
     def run(self) -> None:
         """Run all configured cells, continuing after cell-level failure."""
-        write_metadata(self.config, self.output)
+        write_metadata(
+            self.config, self.output, available_memory_bytes=self.available_memory_bytes,
+            effective_memory_cap_bytes=self.memory_cap_bytes,
+        )
         for dimensions in self.config.dimensions:
             for n_docs in self.config.scales:
                 artifacts = generate_data(self.config, dimensions, n_docs, self.data_root)
@@ -201,26 +242,37 @@ class BenchmarkRunner:
                     if self.config.suites.vector else None
                 )
                 for engine_name in self.engine_names:
-                    context = CellContext(engine_name, dimensions, n_docs,
-                                          self.output / "cells" / f"{engine_name}-d{dimensions}-n{n_docs}")
-                    self._run_cell(context, artifacts, truth)
+                    settings_variants = self.config.engines[engine_name]
+                    explicit_variants = len(settings_variants) > 1
+                    for settings in settings_variants:
+                        variant_label = None
+                        if engine_name == "surrealdb" and explicit_variants:
+                            variant_label = f"{settings.storage}-{settings.transport}"
+                        context = CellContext(
+                            engine_name, dimensions, n_docs, self.output / "cells",
+                            settings=settings, variant_label=variant_label,
+                        )
+                        context.directory = self.output / "cells" / context.cell_id
+                        self._run_cell(context, artifacts, truth)
         self.events.write("run_complete")
 
     def _engine(self, context: CellContext) -> Engine:
-        settings = self.config.engines[context.engine_name]
+        if context.settings is None:
+            settings = self.config.engines[context.engine_name][0]
+        else:
+            settings = context.settings
         workdir = self.engine_root / context.cell_id
         if context.engine_name == "surrealdb":
             return SurrealDBEngine(workdir, context.dimensions,
-                                   self.config.client_timeout_seconds, self.config.memory_cap_bytes,
+                                   self.config.client_timeout_seconds, self.memory_cap_bytes,
                                    settings, self.cache_root, self.config.text)
         return PostgresEngine(workdir, context.dimensions,
-                              self.config.client_timeout_seconds, self.config.memory_cap_bytes,
+                              self.config.client_timeout_seconds, self.memory_cap_bytes,
                               settings, self.config.text)
 
     def _oom_detected(self, engine: Engine) -> bool:
         container = getattr(engine, "container", None)
-        settings = getattr(engine, "settings", None)
-        if container and settings and settings.mode == "docker":
+        if container and getattr(engine, "surreal_in_docker", False):
             result = subprocess.run(["docker", "inspect", "-f", "{{.State.OOMKilled}}", container],
                                     text=True, capture_output=True)
             return result.stdout.strip().lower() == "true"
@@ -232,11 +284,26 @@ class BenchmarkRunner:
     ) -> None:
         context.directory.mkdir(parents=True, exist_ok=True)
         engine = self._engine(context)
-        sampler = MemorySampler(context.directory / "memory.csv", engine.process_roots,
-                                lambda: context.phase)
+        sampler = MemorySampler(
+            context.directory / "memory.csv", engine.process_roots, lambda: context.phase,
+            groups=engine.memory_process_groups,
+        )
+        settings = context.settings
         self.events.write("cell_start", cell_id=context.cell_id, engine=context.engine_name,
                           dimensions=context.dimensions, n_docs=context.n_docs,
-                          memory_cap_bytes=self.config.memory_cap_bytes,
+                          storage=settings.storage if settings else None,
+                          storage_setup=getattr(engine, "tikv_setup", None)
+                          if settings and settings.storage == "tikv" else None,
+                          transport=settings.transport if settings else None,
+                          requested_memory_cap_bytes=self.config.memory_cap_bytes,
+                          available_memory_bytes=self.available_memory_bytes,
+                          memory_cap_bytes=self.memory_cap_bytes,
+                          memory_limits={
+                              "surrealdb_process_tree_bytes": self.memory_cap_bytes
+                              if context.engine_name == "surrealdb" else None,
+                              "tikv_pd_process_tree_bytes": None,
+                              "tikv_pd_limit_policy": "uncapped; measured separately",
+                          },
                           suites=asdict(self.config.suites),
                           query_topics=self.config.query_topics)
         try:
@@ -262,6 +329,8 @@ class BenchmarkRunner:
             load_stats = engine.load(tracked_rows())
             sampler.sample_now()
             load_peak_rss, load_peak_pss = sampler.peak_bytes("load")
+            load_surreal_rss, load_surreal_pss = sampler.peak_group_bytes("surrealdb", "load")
+            load_storage_rss, load_storage_pss = sampler.peak_group_bytes("tikv_pd", "load")
             context.phase = "index_build"
             index_stats = engine.build_index()
             total_queryable = load_stats.seconds + index_stats.seconds
@@ -275,6 +344,10 @@ class BenchmarkRunner:
                               index_details=index_stats.details,
                               load_peak_rss_bytes=load_peak_rss,
                               load_peak_pss_bytes=load_peak_pss,
+                              load_surrealdb_peak_rss_bytes=load_surreal_rss,
+                              load_surrealdb_peak_pss_bytes=load_surreal_pss,
+                              load_tikv_pd_peak_rss_bytes=load_storage_rss,
+                              load_tikv_pd_peak_pss_bytes=load_storage_pss,
                               peak_rss_bytes=load_peak_rss,
                               peak_pss_bytes=load_peak_pss)
             self.events.write("engine_versions", cell_id=context.cell_id, versions=engine.version())
@@ -326,22 +399,38 @@ class BenchmarkRunner:
                     post_truth = self._post_churn_truth(artifacts, truth_path, changes)
                     self._suite(context, engine, artifacts, post_truth, "post_churn", sampler)
             context.phase = "collect"
+            sampler.sample_now()
+            peak_rss, peak_pss = sampler.peak_bytes()
+            surreal_rss, surreal_pss = sampler.peak_group_bytes("surrealdb")
+            storage_rss, storage_pss = sampler.peak_group_bytes("tikv_pd")
             self.events.write("cell_complete", cell_id=context.cell_id, outcome="ok",
                               disk_bytes=engine.disk_bytes(), suites=asdict(self.config.suites),
-                              query_topics=self.config.query_topics)
+                              query_topics=self.config.query_topics,
+                              peak_rss_bytes=peak_rss, peak_pss_bytes=peak_pss,
+                              surrealdb_peak_rss_bytes=surreal_rss,
+                              surrealdb_peak_pss_bytes=surreal_pss,
+                              tikv_pd_peak_rss_bytes=storage_rss,
+                              tikv_pd_peak_pss_bytes=storage_pss)
         except Exception as error:
             sampler.sample_now()
             peak_rss, peak_pss = sampler.peak_bytes()
+            surreal_rss, surreal_pss = sampler.peak_group_bytes("surrealdb")
+            storage_rss, storage_pss = sampler.peak_group_bytes("tikv_pd")
+            cap_peak_rss = surreal_rss if context.engine_name == "surrealdb" else peak_rss
             outcome = _classify_failure(
                 oom_detected=self._oom_detected(engine), engine_alive=engine.alive(),
-                peak_rss_bytes=peak_rss, memory_cap_bytes=self.config.memory_cap_bytes,
+                peak_rss_bytes=cap_peak_rss, memory_cap_bytes=self.memory_cap_bytes,
             )
             failure_phase = _failure_phase(context.phase)
             self.events.write("cell_complete", cell_id=context.cell_id, outcome=outcome,
                               error=repr(error), traceback=traceback.format_exc(),
-                              memory_cap_bytes=self.config.memory_cap_bytes,
+                              memory_cap_bytes=self.memory_cap_bytes,
                               phase=failure_phase, failure_phase=failure_phase,
                               peak_rss_bytes=peak_rss, peak_pss_bytes=peak_pss,
+                              surrealdb_peak_rss_bytes=surreal_rss,
+                              surrealdb_peak_pss_bytes=surreal_pss,
+                              tikv_pd_peak_rss_bytes=storage_rss,
+                              tikv_pd_peak_pss_bytes=storage_pss,
                               suites=asdict(self.config.suites),
                               query_topics=self.config.query_topics)
         finally:

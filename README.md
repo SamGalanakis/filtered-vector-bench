@@ -40,6 +40,11 @@ disk. Results are appended as JSONL/CSV while a cell runs, so completed cells su
 Binary mode downloads SurrealDB `v3.2.1`, verifies its pinned SHA-256 checksum, and caches it.
 The built-in binary downloader targets Linux x86-64; use Docker or supply `engines.surrealdb.binary`
 on other platforms.
+SurrealDB engine configs default to `storage: rocksdb` and `transport: http`. An explicit
+`variants` list expands storage/transport pairs into separate, sequential cells. TiKV variants
+prefer a locally installed TiUP (including `.cache/tiup-home/bin/tiup`) with pinned Playground,
+PD, and TiKV versions; pinned single-node Docker containers are the fallback;
+WebSocket variants use `/rpc` for both load and queries.
 Local PostgreSQL mode expects `initdb` and `postgres` on `PATH` with pgvector available.
 Docker mode uses the pinned images in `docker/docker-compose.yml` and gives each cell an isolated
 container and volume.

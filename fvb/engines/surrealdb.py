@@ -1,4 +1,4 @@
-"""SurrealDB HNSW adapter using HTTP JSON-RPC."""
+"""SurrealDB HNSW adapter with selectable storage and RPC transport."""
 
 from __future__ import annotations
 
@@ -6,9 +6,12 @@ import concurrent.futures
 import hashlib
 import json
 import os
+import shutil
+import signal
 import socket
 import subprocess
 import tarfile
+import threading
 import time
 import urllib.request
 from pathlib import Path
@@ -17,6 +20,8 @@ from typing import Any, Iterable, Sequence, cast
 import httpx
 import numpy as np
 from numpy.typing import NDArray
+from websockets.sync.client import ClientConnection, connect
+from websockets.typing import Subprotocol
 
 from fvb.config import EngineConfig, TextConfig
 from fvb.engines.base import Engine, PhaseStats, Row, directory_size, row_parts
@@ -27,6 +32,12 @@ _ARCHIVE_SHA256 = {
 }
 MAX_LOAD_PAYLOAD_BYTES = 4 * 1024 * 1024
 LOAD_WORKERS = 4
+PD_IMAGE = "pingcap/pd:v8.5.3"
+TIKV_IMAGE = "pingcap/tikv:v8.5.3"
+SURREAL_IMAGE = "surrealdb/surrealdb:v3.2.1"
+TIKV_GRPC_MESSAGE_BYTES = 64 * 1024 * 1024
+TIUP_PLAYGROUND_VERSION = "v1.16.5"
+TIDB_COMPONENT_VERSION = "v8.5.3"
 
 
 def _insert_bodies(rows: Sequence[Row], max_rows: int) -> Iterable[tuple[bytes, int]]:
@@ -67,7 +78,7 @@ def _free_port() -> int:
 
 
 class SurrealDBEngine(Engine):
-    """One isolated SurrealDB RocksDB cell."""
+    """One isolated SurrealDB cell with embedded RocksDB or external TiKV."""
 
     name = "surrealdb"
 
@@ -79,22 +90,90 @@ class SurrealDBEngine(Engine):
         self.text_score_zero_detected = False
         self.cache_dir = cache_dir
         self.port = _free_port()
+        self.pd_port = _free_port()
+        self.tikv_port = _free_port()
         self.container = f"fvb-surreal-{self.port}"
+        self.pd_container = f"fvb-pd-{self.port}"
+        self.tikv_container = f"fvb-tikv-{self.port}"
+        self.network = f"fvb-tikv-{self.port}"
+        self._tiup_tag = f"fvb-{self.port}"
+        cached_tiup = cache_dir / "tiup-home" / "bin" / "tiup"
+        tiup = shutil.which("tiup") or (str(cached_tiup) if cached_tiup.is_file() else None)
+        self._tiup_binary = Path(tiup).resolve() if (
+            tiup and settings.storage == "tikv" and settings.mode == "binary"
+        ) else None
+        self.tikv_setup = "tiup" if self._tiup_binary else "docker"
+        self.surreal_in_docker = settings.mode == "docker" or (
+            settings.storage == "tikv" and self.tikv_setup == "docker"
+        )
         self.process: subprocess.Popen[bytes] | None = None
+        self.tiup_process: subprocess.Popen[bytes] | None = None
         self._binary: Path | None = None
+        self._ws_connections: dict[int, tuple[ClientConnection, bool]] = {}
+        self._ws_lock = threading.Lock()
         self._client = httpx.Client(timeout=timeout, auth=("root", "root"), headers={
             "surreal-ns": "fvb", "surreal-db": "bench", "content-type": "application/json",
         })
 
+    @staticmethod
+    def _checked_rpc_payload(payload: dict[str, Any]) -> object:
+        if "error" in payload:
+            raise RuntimeError(f"SurrealDB RPC error: {payload['error']}")
+        return payload.get("result")
+
+    def _ws_call(self, connection: ClientConnection, method: str,
+                 params: list[object]) -> object:
+        connection.send(json.dumps({"id": 1, "method": method, "params": params}))
+        raw = connection.recv(timeout=self.timeout)
+        payload = cast(dict[str, Any], json.loads(raw))
+        return self._checked_rpc_payload(payload)
+
+    def _ws_connection(self, *, scoped: bool = True) -> ClientConnection:
+        thread_id = threading.get_ident()
+        with self._ws_lock:
+            cached = self._ws_connections.get(thread_id)
+            if cached is None:
+                connection = connect(
+                    f"ws://127.0.0.1:{self.port}/rpc", subprotocols=[Subprotocol("json")],
+                    open_timeout=self.timeout, close_timeout=5, max_size=None,
+                )
+                self._ws_call(connection, "signin", [{
+                    "user": "root", "pass": "root",
+                }])
+                cached = (connection, False)
+                self._ws_connections[thread_id] = cached
+            connection, is_scoped = cached
+            if scoped and not is_scoped:
+                self._ws_call(connection, "use", ["fvb", "bench"])
+                self._ws_connections[thread_id] = (connection, True)
+            return connection
+
+    def _close_ws_connections(self) -> None:
+        with self._ws_lock:
+            connections = list(self._ws_connections.values())
+            self._ws_connections.clear()
+        for connection, _ in connections:
+            try:
+                connection.close()
+            except OSError:
+                pass
+
     def _rpc(self, sql: str, variables: dict[str, object] | None = None) -> list[dict[str, object]]:
+        if self.settings.transport == "ws":
+            payload = self._ws_call(
+                self._ws_connection(), "query", [sql, variables or {}]
+            )
+            statements = cast(list[dict[str, object]], payload)
+            for statement in statements:
+                if statement.get("status") != "OK":
+                    raise RuntimeError(f"SurrealDB statement failed: {statement}")
+            return statements
         response = self._client.post(f"http://127.0.0.1:{self.port}/rpc", json={
             "id": 1, "method": "query", "params": [sql, variables or {}],
         })
         response.raise_for_status()
         payload = cast(dict[str, Any], response.json())
-        if "error" in payload:
-            raise RuntimeError(f"SurrealDB RPC error: {payload['error']}")
-        statements = cast(list[dict[str, object]], payload["result"])
+        statements = cast(list[dict[str, object]], self._checked_rpc_payload(payload))
         for statement in statements:
             if statement.get("status") != "OK":
                 raise RuntimeError(f"SurrealDB statement failed: {statement}")
@@ -102,6 +181,9 @@ class SurrealDBEngine(Engine):
 
     def _sql(self, body: bytes) -> None:
         """Execute one payload-bounded plain-text SurrealQL request."""
+        if self.settings.transport == "ws":
+            self._rpc(body.decode("utf-8"))
+            return
         response = self._client.post(
             f"http://127.0.0.1:{self.port}/sql", content=body,
             headers={"content-type": "text/plain", "accept": "application/json"},
@@ -113,6 +195,20 @@ class SurrealDBEngine(Engine):
                 raise RuntimeError(f"SurrealDB statement failed: {statement}")
 
     def _ensure_namespace(self) -> None:
+        if self.settings.transport == "ws":
+            connection = self._ws_connection(scoped=False)
+            statements = cast(list[dict[str, object]], self._ws_call(
+                connection, "query", [
+                    "DEFINE NAMESPACE IF NOT EXISTS fvb; USE NS fvb; "
+                    "DEFINE DATABASE IF NOT EXISTS bench;", {},
+                ],
+            ))
+            if any(row.get("status") != "OK" for row in statements):
+                raise RuntimeError(f"failed to initialize SurrealDB namespace: {statements}")
+            self._ws_call(connection, "use", ["fvb", "bench"])
+            with self._ws_lock:
+                self._ws_connections[threading.get_ident()] = (connection, True)
+            return
         response = httpx.post(f"http://127.0.0.1:{self.port}/rpc", timeout=self.timeout,
                               auth=("root", "root"), headers={"content-type": "application/json"},
                               json={"id": 1, "method": "query", "params": [
@@ -155,42 +251,212 @@ class SurrealDBEngine(Engine):
         binary.chmod(0o755)
         return binary
 
+    def _remove_docker_resources(self) -> None:
+        for container in (self.container, self.tikv_container, self.pd_container):
+            subprocess.run(["docker", "rm", "-f", container], capture_output=True)
+        subprocess.run(["docker", "network", "rm", self.network], capture_output=True)
+
+    def _create_tikv_cluster(self) -> None:
+        pd_data = self.workdir / "pd-data"
+        tikv_data = self.workdir / "tikv-data"
+        for path in (pd_data, tikv_data):
+            path.mkdir(exist_ok=True)
+            path.chmod(0o777)
+        tikv_config = self.workdir / "tikv.toml"
+        tikv_config.write_text(
+            f"[server]\nmax-grpc-send-msg-len = {TIKV_GRPC_MESSAGE_BYTES}\n",
+            encoding="utf-8",
+        )
+        subprocess.run(["docker", "network", "create", self.network], check=True,
+                       capture_output=True)
+        subprocess.run([
+            "docker", "create", "--name", self.pd_container, "--network", self.network,
+            "--network-alias", "pd", "-p", f"127.0.0.1:{self.pd_port}:2379",
+            "-v", f"{pd_data.resolve()}:/data", PD_IMAGE,
+            "--name=pd", "--data-dir=/data", "--client-urls=http://0.0.0.0:2379",
+            "--advertise-client-urls=http://pd:2379", "--peer-urls=http://0.0.0.0:2380",
+            "--advertise-peer-urls=http://pd:2380", "--initial-cluster=pd=http://pd:2380",
+        ], check=True, capture_output=True)
+        subprocess.run([
+            "docker", "create", "--name", self.tikv_container, "--network", self.network,
+            "--network-alias", "tikv", "-v", f"{tikv_data.resolve()}:/data",
+            "-v", f"{tikv_config.resolve()}:/etc/tikv/tikv.toml:ro", TIKV_IMAGE,
+            "--addr=0.0.0.0:20160", "--advertise-addr=tikv:20160", "--data-dir=/data",
+            "--pd=pd:2379", "--config=/etc/tikv/tikv.toml",
+        ], check=True, capture_output=True)
+
+    def _create_tiup_cluster(self) -> None:
+        """Launch a pinned single-PD/single-TiKV playground with cell-local data."""
+        assert self._tiup_binary is not None
+        tiup_home = self.cache_dir / "tiup-home"
+        tag = self._tiup_tag
+        data_target = self.workdir / "tiup-data"
+        data_target.mkdir(exist_ok=True)
+        data_link = tiup_home / "data" / tag
+        data_link.parent.mkdir(parents=True, exist_ok=True)
+        if data_link.is_symlink():
+            data_link.unlink()
+        elif data_link.exists():
+            raise RuntimeError(f"refusing to replace existing TiUP data path: {data_link}")
+        data_link.symlink_to(data_target.resolve(), target_is_directory=True)
+        tikv_config = self.workdir / "tikv.toml"
+        tikv_config.write_text(
+            f"[server]\nmax-grpc-send-msg-len = {TIKV_GRPC_MESSAGE_BYTES}\n",
+            encoding="utf-8",
+        )
+        env = dict(os.environ, TIUP_HOME=str(tiup_home.resolve()))
+        subprocess.run([
+            str(self._tiup_binary), "install", f"playground:{TIUP_PLAYGROUND_VERSION}",
+            f"pd:{TIDB_COMPONENT_VERSION}", f"tikv:{TIDB_COMPONENT_VERSION}",
+        ], check=True, capture_output=True, env=env)
+        log = (self.workdir / "tiup-playground.log").open("ab")
+        command = [
+            str(self._tiup_binary), f"playground:{TIUP_PLAYGROUND_VERSION}",
+            TIDB_COMPONENT_VERSION, "--mode", "tikv-slim", "--without-monitor",
+            "--host", "127.0.0.1", "--pd", "1", "--kv", "1",
+            "--pd.port", str(self.pd_port), "--kv.port", str(self.tikv_port),
+            "--kv.config", str(tikv_config.resolve()), "--tag", tag,
+        ]
+        self.tiup_process = subprocess.Popen(
+            command, stdout=log, stderr=subprocess.STDOUT, env=env,
+            start_new_session=True,
+        )
+        log.close()
+
+    def _create_surreal_container(self) -> None:
+        data = self.workdir / "data"
+        command = [
+            "docker", "create", "--name", self.container, "--memory",
+            str(self.memory_cap_bytes), "-p", f"127.0.0.1:{self.port}:8000",
+            "-e", "SURREAL_HTTP_MAX_SQL_BODY_SIZE=64MiB",
+            "-e", "SURREAL_HTTP_MAX_RPC_BODY_SIZE=64MiB",
+        ]
+        if self.settings.storage == "tikv":
+            command += [
+                "--network", self.network,
+                "-e", f"SURREAL_TIKV_GRPC_MAX_DECODING_MESSAGE_SIZE={TIKV_GRPC_MESSAGE_BYTES}",
+                "-e", f"SURREAL_TIKV_GRPC_MAX_ENCODING_MESSAGE_SIZE={TIKV_GRPC_MESSAGE_BYTES}",
+            ]
+            datastore = "tikv://pd:2379"
+        else:
+            command += ["-v", f"{data.resolve()}:/data"]
+            datastore = "rocksdb:/data/fvb.db"
+        command += [
+            self.settings.image or SURREAL_IMAGE, "start", "--log", "warn",
+            "--user", "root", "--pass", "root", datastore,
+        ]
+        subprocess.run(command, check=True, capture_output=True)
+
     def prepare(self) -> None:
-        """Create an empty container or resolve the verified local binary."""
+        """Create isolated storage resources and resolve the SurrealDB executable."""
         self.workdir.mkdir(parents=True, exist_ok=True)
         (self.workdir / "data").mkdir(exist_ok=True)
-        if self.settings.mode == "docker":
+        if self.settings.storage == "tikv" and self.tikv_setup == "tiup":
+            self._binary = self._download_binary()
+            self._create_tiup_cluster()
+        elif self.surreal_in_docker:
             (self.workdir / "data").chmod(0o777)
-            subprocess.run(["docker", "rm", "-f", self.container], capture_output=True)
-            subprocess.run([
-                "docker", "create", "--name", self.container,
-                "--memory", str(self.memory_cap_bytes), "-p", f"127.0.0.1:{self.port}:8000",
-                "-e", "SURREAL_HTTP_MAX_SQL_BODY_SIZE=64MiB",
-                "-e", "SURREAL_HTTP_MAX_RPC_BODY_SIZE=64MiB",
-                "-v", f"{(self.workdir / 'data').resolve()}:/data",
-                self.settings.image or "surrealdb/surrealdb:v3.2.1", "start", "--log", "warn",
-                "--user", "root", "--pass", "root", "rocksdb:/data/fvb.db",
-            ], check=True, capture_output=True)
+            self._remove_docker_resources()
+            if self.settings.storage == "tikv":
+                self._create_tikv_cluster()
+            self._create_surreal_container()
         else:
             self._binary = self._download_binary()
+
+    def _docker_running(self, container: str) -> bool:
+        result = subprocess.run(
+            ["docker", "inspect", "-f", "{{.State.Running}}", container],
+            text=True, capture_output=True,
+        )
+        return result.returncode == 0 and result.stdout.strip() == "true"
+
+    def _wait_for_docker_tikv(self) -> None:
+        if not self._docker_running(self.pd_container):
+            subprocess.run(["docker", "start", self.pd_container], check=True,
+                           capture_output=True)
+        deadline = time.monotonic() + self.timeout
+        pd_url = f"http://127.0.0.1:{self.pd_port}"
+        while time.monotonic() < deadline:
+            try:
+                if httpx.get(f"{pd_url}/pd/api/v1/health", timeout=2).is_success:
+                    break
+            except httpx.HTTPError:
+                pass
+            time.sleep(0.2)
+        else:
+            raise TimeoutError("PD did not become ready")
+        if not self._docker_running(self.tikv_container):
+            subprocess.run(["docker", "start", self.tikv_container], check=True,
+                           capture_output=True)
+        while time.monotonic() < deadline:
+            try:
+                response = httpx.get(f"{pd_url}/pd/api/v1/stores", timeout=2)
+                stores = response.json().get("stores", []) if response.is_success else []
+                if any(store.get("store", {}).get("state_name") == "Up" for store in stores):
+                    return
+            except (httpx.HTTPError, ValueError, AttributeError):
+                pass
+            if not self._docker_running(self.tikv_container):
+                logs = subprocess.run(
+                    ["docker", "logs", self.tikv_container], text=True, capture_output=True,
+                ).stderr[-4000:]
+                raise RuntimeError(f"TiKV container exited: {logs}")
+            time.sleep(0.5)
+        raise TimeoutError("TiKV did not register as Up with PD")
+
+    def _wait_for_tiup_tikv(self) -> None:
+        """Wait until TiUP's pinned PD reports its one TiKV store as Up."""
+        assert self.tiup_process is not None
+        deadline = time.monotonic() + self.timeout
+        pd_url = f"http://127.0.0.1:{self.pd_port}"
+        while time.monotonic() < deadline:
+            if self.tiup_process.poll() is not None:
+                log = (self.workdir / "tiup-playground.log").read_text(
+                    encoding="utf-8", errors="replace"
+                )[-4000:]
+                raise RuntimeError(f"TiUP playground exited: {log}")
+            try:
+                response = httpx.get(f"{pd_url}/pd/api/v1/stores", timeout=2)
+                stores = response.json().get("stores", []) if response.is_success else []
+                if any(store.get("store", {}).get("state_name") == "Up" for store in stores):
+                    return
+            except (httpx.HTTPError, ValueError, AttributeError):
+                pass
+            time.sleep(0.5)
+        raise TimeoutError("TiUP TiKV did not register as Up with PD")
 
     def start(self) -> float:
         """Start SurrealDB and wait for its health endpoint."""
         started = time.perf_counter()
-        if self.settings.mode == "docker":
+        if self.settings.storage == "tikv":
+            if self.tikv_setup == "tiup":
+                self._wait_for_tiup_tikv()
+            else:
+                self._wait_for_docker_tikv()
+        if self.surreal_in_docker:
             subprocess.run(["docker", "start", self.container], check=True, capture_output=True)
         else:
             assert self._binary is not None
+            datastore = (
+                f"tikv://127.0.0.1:{self.pd_port}" if self.settings.storage == "tikv"
+                else f"rocksdb:{self.workdir / 'data' / 'fvb.db'}"
+            )
             command, preexec = self.limited_command([
                 str(self._binary), "start", "--bind", f"127.0.0.1:{self.port}", "--log", "warn",
-                "--user", "root", "--pass", "root", f"rocksdb:{self.workdir / 'data' / 'fvb.db'}",
+                "--user", "root", "--pass", "root", datastore,
             ])
             log = (self.workdir / "surreal.log").open("ab")
             env = dict(os.environ,
                        SURREAL_HTTP_MAX_SQL_BODY_SIZE="64MiB",
                        SURREAL_HTTP_MAX_RPC_BODY_SIZE="64MiB")
+            if self.settings.storage == "tikv":
+                env.update(
+                    SURREAL_TIKV_GRPC_MAX_DECODING_MESSAGE_SIZE=str(TIKV_GRPC_MESSAGE_BYTES),
+                    SURREAL_TIKV_GRPC_MAX_ENCODING_MESSAGE_SIZE=str(TIKV_GRPC_MESSAGE_BYTES),
+                )
             self.process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT,
                                             env=env, preexec_fn=preexec)  # type: ignore[arg-type]
+            log.close()
         deadline = time.monotonic() + self.timeout
         while time.monotonic() < deadline:
             try:
@@ -198,7 +464,7 @@ class SurrealDBEngine(Engine):
                     return time.perf_counter() - started
             except httpx.HTTPError:
                 pass
-            if self.settings.mode == "docker":
+            if self.surreal_in_docker:
                 status = subprocess.run(
                     ["docker", "inspect", "-f", "{{.State.Running}} {{.State.ExitCode}}", self.container],
                     text=True, capture_output=True,
@@ -207,14 +473,15 @@ class SurrealDBEngine(Engine):
                     logs = subprocess.run(["docker", "logs", self.container], text=True,
                                           capture_output=True).stderr[-2000:]
                     raise RuntimeError(f"SurrealDB container exited ({status}): {logs}")
-            if self.settings.mode != "docker" and self.process and self.process.poll() is not None:
+            if not self.surreal_in_docker and self.process and self.process.poll() is not None:
                 raise RuntimeError(f"SurrealDB exited with {self.process.returncode}")
             time.sleep(0.2)
         raise TimeoutError("SurrealDB did not become ready")
 
     def stop(self) -> None:
         """Stop the current service while retaining durable storage."""
-        if self.settings.mode == "docker":
+        self._close_ws_connections()
+        if self.surreal_in_docker:
             subprocess.run(["docker", "stop", "-t", "30", self.container], capture_output=True)
         elif self.process and self.process.poll() is None:
             self.process.terminate()
@@ -266,7 +533,12 @@ class SurrealDBEngine(Engine):
         return PhaseStats(elapsed, count, self.disk_bytes(), {
             "index_maintained_during_load": True,
             "text_index_maintained_during_load": self.text.enabled,
-            "endpoint": "/sql",
+            "endpoint": "/rpc (WebSocket)" if self.settings.transport == "ws" else "/sql",
+            "transport": self.settings.transport,
+            "storage": self.settings.storage,
+            "tikv_grpc_message_limit_bytes": (
+                TIKV_GRPC_MESSAGE_BYTES if self.settings.storage == "tikv" else None
+            ),
             "load_workers": LOAD_WORKERS,
             "max_request_rows": max_body_rows,
             "max_request_bytes": max_body_bytes,
@@ -398,19 +670,107 @@ class SurrealDBEngine(Engine):
         """Read the server version through its unauthenticated version endpoint."""
         response = self._client.get(f"http://127.0.0.1:{self.port}/version")
         response.raise_for_status()
-        return {"surrealdb": response.text.strip().strip('"'), "storage": "RocksDB"}
+        versions = {
+            "surrealdb": response.text.strip().strip('"'),
+            "storage": "TiKV" if self.settings.storage == "tikv" else "RocksDB",
+            "transport": self.settings.transport,
+        }
+        if self.settings.storage == "tikv":
+            if self.tikv_setup == "tiup":
+                assert self._tiup_binary is not None
+                tiup_home = self.cache_dir / "tiup-home"
+                env = dict(os.environ, TIUP_HOME=str(tiup_home.resolve()))
+                for key in ("pd", "tikv"):
+                    result = subprocess.run(
+                        [str(self._tiup_binary), f"{key}:{TIDB_COMPONENT_VERSION}", "--version"],
+                        text=True, capture_output=True, env=env,
+                    )
+                    output = (result.stdout or result.stderr).strip().replace("\n", "; ")
+                    versions[key] = output or "version unavailable"
+                tiup_version = subprocess.run(
+                    [str(self._tiup_binary), "--version"], text=True, capture_output=True,
+                    env=env,
+                )
+                versions["tiup"] = tiup_version.stdout.strip().replace("\n", "; ")
+                versions["playground"] = TIUP_PLAYGROUND_VERSION
+                versions["topology"] = "single PD + single TiKV; TiUP tikv-slim"
+            else:
+                for key, container, binary, image in (
+                    ("pd", self.pd_container, "/pd-server", PD_IMAGE),
+                    ("tikv", self.tikv_container, "/tikv-server", TIKV_IMAGE),
+                ):
+                    result = subprocess.run(
+                        ["docker", "exec", container, binary, "--version"],
+                        text=True, capture_output=True,
+                    )
+                    output = (result.stdout or result.stderr).strip().replace("\n", "; ")
+                    versions[key] = f"{output or 'version unavailable'} (image {image})"
+                versions["topology"] = "single PD + single TiKV; isolated Docker network"
+            versions["setup"] = self.tikv_setup
+            versions["tikv_grpc_message_limit_bytes"] = str(TIKV_GRPC_MESSAGE_BYTES)
+        return versions
+
+    def _tiup_component_roots(self) -> list[int]:
+        """Resolve only the PD/TiKV roots below the TiUP supervisor."""
+        if self.tiup_process is None or self.tiup_process.poll() is not None:
+            return []
+        descendants = {self.tiup_process.pid}
+        changed = True
+        while changed:
+            changed = False
+            for entry in Path("/proc").iterdir():
+                if not entry.name.isdigit() or int(entry.name) in descendants:
+                    continue
+                try:
+                    parent = int((entry / "stat").read_text().split()[3])
+                except (OSError, IndexError, ValueError):
+                    continue
+                if parent in descendants:
+                    descendants.add(int(entry.name))
+                    changed = True
+        roots = []
+        for pid in descendants:
+            try:
+                executable = Path(f"/proc/{pid}/exe").resolve().name
+            except OSError:
+                continue
+            if executable in {"pd-server", "tikv-server"}:
+                roots.append(pid)
+        return roots
 
     def process_roots(self) -> list[int]:
         """Resolve the host process for local or Docker mode."""
-        if self.settings.mode == "docker":
+        if self.surreal_in_docker:
             result = subprocess.run(["docker", "inspect", "-f", "{{.State.Pid}}", self.container],
                                     text=True, capture_output=True)
             return [int(result.stdout.strip())] if result.returncode == 0 and result.stdout.strip() != "0" else []
         return [self.process.pid] if self.process and self.process.poll() is None else []
 
+    def memory_process_groups(self) -> dict[str, list[int]]:
+        """Attribute query-process memory separately from the external storage cluster."""
+        groups = {"surrealdb": self.process_roots()}
+        if self.settings.storage == "tikv":
+            storage_roots = self._tiup_component_roots()
+            if self.tikv_setup == "docker":
+                storage_roots = []
+                for container in (self.pd_container, self.tikv_container):
+                    result = subprocess.run(
+                        ["docker", "inspect", "-f", "{{.State.Pid}}", container],
+                        text=True, capture_output=True,
+                    )
+                    if result.returncode == 0 and result.stdout.strip() not in {"", "0"}:
+                        storage_roots.append(int(result.stdout.strip()))
+            groups["tikv_pd"] = storage_roots
+        return groups
+
     def disk_bytes(self) -> int:
         """Return RocksDB directory bytes."""
-        if self.settings.mode == "docker" and self.process_roots():
+        if self.settings.storage == "tikv":
+            if self.tikv_setup == "tiup":
+                return directory_size(self.workdir / "tiup-data")
+            return (directory_size(self.workdir / "pd-data") +
+                    directory_size(self.workdir / "tikv-data"))
+        if self.surreal_in_docker and self.process_roots():
             result = subprocess.run(["docker", "exec", self.container, "du", "-sb", "/data"],
                                     text=True, capture_output=True)
             if result.returncode == 0:
@@ -431,6 +791,18 @@ class SurrealDBEngine(Engine):
             )
 
     def cleanup(self) -> None:
-        """Remove the disposable container definition."""
-        if self.settings.mode == "docker":
-            subprocess.run(["docker", "rm", "-f", self.container], capture_output=True)
+        """Stop the external storage cluster and remove disposable launch resources."""
+        if self.tiup_process is not None and self.tiup_process.poll() is None:
+            try:
+                os.killpg(self.tiup_process.pid, signal.SIGTERM)
+                self.tiup_process.wait(timeout=20)
+            except subprocess.TimeoutExpired:
+                os.killpg(self.tiup_process.pid, signal.SIGKILL)
+                self.tiup_process.wait(timeout=10)
+        self.tiup_process = None
+        if self._tiup_binary is not None:
+            data_link = self.cache_dir / "tiup-home" / "data" / self._tiup_tag
+            if data_link.is_symlink():
+                data_link.unlink()
+        if self.surreal_in_docker:
+            self._remove_docker_resources()

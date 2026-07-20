@@ -23,8 +23,9 @@ def main() -> None:
     parser.add_argument("--out", type=Path, default=None)
     args = parser.parse_args()
     output = args.out or ROOT / "results" / datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    engines = ("surrealdb", "postgres") if args.engine == "all" else (args.engine,)
-    run_benchmark(load_config(args.config.resolve()), output.resolve(), engines)
+    config = load_config(args.config.resolve())
+    engines = tuple(config.engines) if args.engine == "all" else (args.engine,)
+    run_benchmark(config, output.resolve(), engines)
     print(output.resolve())
 
 

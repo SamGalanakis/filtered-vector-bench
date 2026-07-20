@@ -46,9 +46,33 @@ time, just like vector chunks. With the default vocabulary widths the 200-token 
 The fixed width trades some disk overhead for deterministic O(1) random access without an in-RAM
 million-string object array.
 
+## Storage backend experiment
+
+The default SurrealDB cell still uses embedded RocksDB. The backend matrix also runs a local
+single-PD, single-TiKV topology, with both PD and TiKV data under the cell work directory. The
+preferred launcher is pinned TiUP Playground `v1.16.5` in `tikv-slim` mode; pinned Docker images
+are retained as the fallback when TiUP is unavailable. TiKV is a distributed KV store accessed over the network even in this
+single-node form, so latency is expected to be worse than embedded RocksDB by construction. This
+experiment is about *where memory goes and whether failures reproduce*, not about which backend is
+faster.
+
+The configured memory cap applies only to the SurrealDB query-process tree. PD and TiKV are not
+given the identical cap: their combined tree is uncapped within the host, and is sampled and
+reported separately from SurrealDB as well as in the cell total. This deliberately preserves the
+question under test—whether SurrealDB itself balloons when storage is external—while retaining the
+storage layer's full cost. The topology, image pins, limits, and process-tree split are recorded in
+raw events and reports.
+
+SurrealDB 3.2.x defaults its TiKV client to 4 MiB gRPC encode/decode messages, while TiKV defaults
+server sends to 10 MiB. Even the 5k smoke HNSW query produced a 7.0 MiB response, so the backend
+cells explicitly set the client encode/decode and TiKV server-send limits to 64 MiB. This is a
+pinned compatibility prerequisite rather than a query or memory optimization; the effective
+value is recorded with the engine versions and load details.
+
 ## Durability
 
-SurrealDB uses its RocksDB backend with SurrealDB 3.x sync-by-default behavior. PostgreSQL uses
+SurrealDB uses either its RocksDB backend with SurrealDB 3.x sync-by-default behavior or the
+durable TiKV topology described above. PostgreSQL uses
 `synchronous_commit=on`; no unlogged tables or durability-relaxing load switches are used. Both
 therefore measure durable default writes rather than comparing durable and ephemeral storage.
 
@@ -100,7 +124,9 @@ same accounting. Docker container PIDs are resolved from the host. Samples are p
 PostgreSQL keeps one client backend alive throughout query suites, as the control harness does, so
 the postmaster and its query backend are simultaneously present when the sampler walks descendants.
 
-Every engine starts under the same configured OS memory cap. `systemd-run --user --scope` with
+Every query-engine process tree starts under the same configured OS memory cap. As stated in the
+storage-backend experiment, external PD and TiKV are the deliberate exception: they remain
+uncapped and are accounted separately. `systemd-run --user --scope` with
 `MemoryMax` is preferred for local processes; an address-space `ulimit` fallback is used where a
 user systemd manager is unavailable. Docker receives the equivalent `--memory` limit. A cap kill
 is a first-class `exceeded_memory_cap` cell outcome, plotted at the cap, not a missing observation.
@@ -135,6 +161,13 @@ Each adapter uses its engine's documented idiomatic ANN form rather than forcing
 
 These may use pre- or post-filtering differently. Exact eligible-subset recall and underfill are
 reported precisely so that behavior remains observable.
+
+SurrealDB transport is independently configurable as HTTP or WebSocket. HTTP mode retains the
+bounded four-worker `/sql` loader and JSON-RPC `/rpc` queries. WebSocket mode sends both load and
+query statements through the documented `/rpc` WebSocket JSON protocol with the same SQL,
+variables, worker count, row batching, and payload bound. SurrealDB is WebSocket-primary in
+production usage, so the transport matrix checks whether an HTTP-measured failure reproduces on
+that production-relevant path rather than allowing the result to be dismissed as HTTP-specific.
 
 The full-text and hybrid forms are likewise native rather than textually symmetric:
 
@@ -185,7 +218,9 @@ accounting, but is not a target memory value for the differently configured ladd
 
 ## Versions and host evidence
 
-Container tags are pinned to `surrealdb/surrealdb:v3.2.1` and `pgvector/pgvector:pg17`; binary
+TiUP Playground is pinned to `v1.16.5`, its PD and TiKV components are pinned to `v8.5.3`, and
+fallback container tags are pinned to `surrealdb/surrealdb:v3.2.1`, `pingcap/pd:v8.5.3`,
+`pingcap/tikv:v8.5.3`, and `pgvector/pgvector:pg17`; binary
 SurrealDB downloads are pinned and checksum-verified. Runtime server and extension versions are
 recorded rather than inferred from tags. Every result directory includes the normalized config,
 its SHA-256 hash, `lscpu`, `/proc/meminfo`, platform data, and timestamps. Comparisons from

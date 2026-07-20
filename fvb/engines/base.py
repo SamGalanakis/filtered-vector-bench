@@ -117,6 +117,10 @@ class Engine(abc.ABC):
     def process_roots(self) -> list[int]:
         """Return host process IDs at the roots of the engine process tree."""
 
+    def memory_process_groups(self) -> dict[str, list[int]]:
+        """Return separately attributable process-root groups for memory sampling."""
+        return {"engine": self.process_roots()}
+
     @abc.abstractmethod
     def disk_bytes(self) -> int:
         """Return durable storage bytes for this cell."""
